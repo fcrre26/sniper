@@ -50,6 +50,20 @@ try:
 except ImportError:
     print('AIOHTTP: 未安装 ✗')
     exit(5)
+
+try:
+    import daemon
+    print('Python-Daemon: 已安装 ✓')
+except ImportError:
+    print('Python-Daemon: 未安装 ✗')
+    exit(6)
+
+try:
+    import lockfile
+    print('Lockfile: 已安装 ✓')
+except ImportError:
+    print('Lockfile: 未安装 ✗')
+    exit(7)
 "
     local check_result=$?
     
@@ -123,16 +137,62 @@ install_dependencies() {
     pip install urllib3           # HTTP客户端（requests的依赖）
     pip install cryptography      # 加密库（可能需要）
     pip install python-dateutil   # 日期处理
+    pip install python-daemon lockfile
 
     # 检查安装结果
     echo -e "\n====== 依赖安装完成 ======"
     echo "已安装的包版本:"
-    pip freeze | grep -E "ccxt|websocket-client|requests|pytz|aiohttp|urllib3|cryptography|python-dateutil"
+    pip freeze | grep -E "ccxt|websocket-client|requests|pytz|aiohttp|urllib3|cryptography|python-dateutil|python-daemon|lockfile"
 
     echo -e "\n如果看到以上包的版本信息，说明安装成功"
     echo "====== 安装完成 ======"
     
     return $SUCCESS
+}
+
+# 安装systemd服务
+install_service() {
+    echo "正在安装系统服务..."
+    
+    # 创建服务文件
+    sudo cat > /etc/systemd/system/binance-sniper.service << EOF
+[Unit]
+Description=Binance Sniper Service
+After=network.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$(pwd)
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$(which python3) binance_sniper.py --daemon
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/binance-sniper/output.log
+StandardError=append:/var/log/binance-sniper/error.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # 创建日志目录
+    sudo mkdir -p /var/log/binance-sniper
+    sudo chown $USER:$USER /var/log/binance-sniper
+
+    # 重新加载systemd配置
+    sudo systemctl daemon-reload
+
+    # 启用服务
+    sudo systemctl enable binance-sniper.service
+
+    echo """
+=== 服务安装完成 ===
+使用以下命令控制服务:
+- 启动: sudo systemctl start binance-sniper
+- 停止: sudo systemctl stop binance-sniper
+- 状态: sudo systemctl status binance-sniper
+- 查看日志: tail -f /var/log/binance-sniper/output.log
+"""
 }
 
 # 测试币安API延迟函数
@@ -235,10 +295,11 @@ while true; do
 1. 检查依赖
 2. 立即运行程序
 3. 测试API延迟
+4. 安装系统服务
 0. 退出安装脚本
 ============================
 """
-    read -p "请选择操作 (0-3): " choice
+    read -p "请选择操作 (0-4): " choice
     case $choice in
         1)
             check_dependencies
@@ -262,6 +323,9 @@ while true; do
             ;;
         3)
             test_binance_latency
+            ;;
+        4)
+            install_service
             ;;
         0)
             echo "退出安装脚本"
