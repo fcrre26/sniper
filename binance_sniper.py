@@ -438,8 +438,75 @@ class BinanceSniper:
         print(f"{status}")
         print("========================\n")
 
+    def analyze_opening_price(self) -> float:
+        """分析开盘价格"""
+        try:
+            # 获取订单簿深度
+            orderbook = self.query_client.fetch_order_book(self.symbol, limit=20)
+            if not orderbook or not orderbook['asks']:
+                return None
+            
+            asks = orderbook['asks'][:5]  # 取前5个卖单
+            
+            # 计算加权平均价格
+            total_volume = sum(vol for _, vol in asks)
+            weighted_price = sum(price * vol for price, vol in asks) / total_volume
+            
+            # 获取最低卖价
+            min_price = asks[0][0]
+            
+            logger.info(f"分析开盘价格: 最低卖价={min_price}, 加权均价={weighted_price}")
+            return min_price
+        
+        except Exception as e:
+            logger.error(f"分析开盘价格失败: {str(e)}")
+            return None
+
+    def auto_adjust_price_protection(self, opening_price: float):
+        """根据开盘价自动调整价格保护"""
+        if not opening_price:
+            return
+        
+        # 自动设置价格保护参数
+        self.reference_price = opening_price
+        self.max_price_limit = opening_price * 1.5  # 最高接受1.5倍开盘价
+        self.max_slippage = 0.1  # 10%滑点
+        
+        logger.info(
+            f"价格保护自动调整:\n"
+            f"开盘价: {opening_price}\n"
+            f"最高接受价格: {self.max_price_limit}\n"
+            f"参考价格: {self.reference_price}\n"
+            f"最大滑点: {self.max_slippage*100}%"
+        )
+
     def snipe(self):
         """开始抢购"""
+        # 显示初始策略确认
+        strategy_info = (
+            "====== 抢购策略设置 ======\n"
+            f"交易对: {self.symbol}\n"
+            f"买入数量: {self.amount}\n"
+            f"买入方式: {'限价单' if self.price else '市价单(带保护)'}\n"
+            "\n--- 价格保护 ---\n"
+            "· 开盘自动获取价格并调整保护参数\n"
+            "· 最高价格 = 开盘价 * 1.5\n"
+            "· 最大滑点: 10%\n"
+            f"· 最小深度: {self.min_depth_requirement}个订单\n"
+            "\n--- 卖出策略 ---\n"
+        )
+
+        if self.sell_ladders:
+            for i, (profit, percent) in enumerate(self.sell_ladders, 1):
+                strategy_info += f"  梯队{i}: +{profit*100}% → {percent*100}%\n"
+        
+        strategy_info += f"\n止损: -{self.stop_loss*100}%\n"
+        strategy_info += "\n确认开始抢购? (yes/no): "
+        
+        self.print_status(strategy_info)
+        if input().lower() != 'yes':
+            return None
+
         logger.info(f"开始抢购 {self.symbol}")
         max_attempts, check_interval = self.config.get_snipe_settings()
         attempt = 0
@@ -448,66 +515,43 @@ class BinanceSniper:
             return None
 
         while attempt < max_attempts:
-            # 更新状态显示
-            status = (
-                f"交易对: {self.symbol}\n"
-                f"当前进度: 第 {attempt + 1} 次尝试 (共 {max_attempts} 次)\n"
-                f"当前状态: 正在等待开盘\n"
-                f"按 Ctrl+C 可以终止程序"
+            # 状态显示
+            current_status = (
+                f"正在监控 {self.symbol}\n"
+                f"尝试次数: {attempt + 1}/{max_attempts}\n"
+                f"按 Ctrl+C 终止\n"
             )
-            self.print_status(status)
+            self.print_status(current_status)
 
             if self.check_trading_status():
-                self.print_status("检测到交易已开盘，准备下单...")
-                depth_info = self.analyze_market_depth()
-                if depth_info:
-                    logger.debug(f"深度分析: {json.dumps(depth_info, indent=2)}")
+                # 检测到开盘，立即获取价格并下单
+                opening_price = self.analyze_opening_price()
+                if opening_price:
+                    self.auto_adjust_price_protection(opening_price)
+                    depth_info = self.analyze_market_depth()
                     
-                    if depth_info['total_volume'] < self.amount:
-                        status = (
-                            f"交易对: {self.symbol}\n"
-                            f"当前状态: 市场深度不足\n"
-                            f"需要数量: {self.amount}\n"
-                            f"可用数量: {depth_info['total_volume']}\n"
-                            f"继续等待中..."
-                        )
-                        self.print_status(status)
-                        time.sleep(0.1)
-                        continue
+                    if depth_info and depth_info['total_volume'] >= self.amount:
+                        # 直接下单，不再提示确认
+                        if self.price:
+                            order = self.place_limit_order()
+                        else:
+                            order = self.place_market_order()
 
-                    if self.reference_price and depth_info['avg_price'] > self.reference_price * 1.1:
-                        status = (
-                            f"交易对: {self.symbol}\n"
-                            f"当前状态: 价格过高\n"
-                            f"当前均价: {depth_info['avg_price']}\n"
-                            f"参考价格: {self.reference_price}\n"
-                            f"继续等待中..."
-                        )
-                        self.print_status(status)
-                        time.sleep(0.1)
-                        continue
-
-                # 下单逻辑
-                self.print_status("正在提交订单...")
-                if self.price:
-                    order = self.place_limit_order()
-                else:
-                    order = self.place_market_order()
-
-                if order:
-                    status = (
-                        f"交易对: {self.symbol}\n"
-                        f"订单状态: 下单成功!\n"
-                        f"订单编号: {order['id']}\n"
-                        f"成交价格: {order.get('price', '市价')}\n"
-                        f"成交数量: {order['amount']}\n"
-                        f"正在确认成交..."
-                    )
-                    self.print_status(status)
-                    
-                    # 启动订单状态监控
-                    threading.Thread(target=self.track_order, args=(order['id'],)).start()
-                    return order
+                        if order:
+                            status = (
+                                f"下单成功!\n"
+                                f"交易对: {self.symbol}\n"
+                                f"开盘价: {opening_price}\n"
+                                f"成交价: {order.get('price', '市价')}\n"
+                                f"数量: {order['amount']}\n"
+                                f"订单ID: {order['id']}\n"
+                                "\n正在启动自动卖出监控..."
+                            )
+                            self.print_status(status)
+                            
+                            # 启动订单监控和自动卖出
+                            threading.Thread(target=self.track_order, args=(order['id'],)).start()
+                            return order
 
             attempt += 1
             time.sleep(0.1)  # 100ms
@@ -533,18 +577,67 @@ class BinanceSniper:
             logger.error(f"系统预热失败: {str(e)}")
             return False
 
+    def get_position(self) -> dict:
+        """获取当前持仓"""
+        try:
+            balance = self.query_client.fetch_balance()
+            if not self.symbol:
+                return None
+            
+            base_currency = self.symbol.split('/')[0]  # 如 BTC/USDT 中的 BTC
+            position = {
+                'symbol': self.symbol,
+                'amount': balance[base_currency]['free'],
+                'current_price': self.get_market_price(),
+                'value': 0
+            }
+            
+            if position['current_price']:
+                position['value'] = position['amount'] * position['current_price']
+            
+            return position
+        except Exception as e:
+            logger.error(f"获取持仓失败: {str(e)}")
+            return None
+
+    def place_market_sell_order(self, amount: float):
+        """下市价卖单"""
+        try:
+            order = self.trade_client.create_market_sell_order(
+                symbol=self.symbol,
+                amount=amount
+            )
+            logger.info(f"市价卖单下单成功: {order}")
+            self.save_trade_history(order)
+            return order
+        except Exception as e:
+            logger.error(f"卖出失败: {str(e)}")
+            return None
+
+    def place_limit_sell_order(self, amount: float, price: float):
+        """下限价卖单"""
+        try:
+            order = self.trade_client.create_limit_sell_order(
+                symbol=self.symbol,
+                amount=amount,
+                price=price
+            )
+            logger.info(f"限价卖单下单成功: {order}")
+            self.save_trade_history(order)
+            return order
+        except Exception as e:
+            logger.error(f"卖出失败: {str(e)}")
+            return None
+
 def print_menu():
     """打印主菜单"""
     print("\n=== 币安现货抢币工具 ===")
     print("1. 设置API密钥")
-    print("2. 设置交易对")
-    print("3. 设置购买数量")
-    print("4. 设置价格 (可选)")
-    print("5. 设置价格保护")
-    print("6. 设置抢购参数")
-    print("7. 设置止盈止损")
-    print("8. 显示当前设置")
-    print("9. 开始抢购")
+    print("2. 抢开盘策略设置")  # 新的集中设置选项
+    print("3. 查看当前策略")
+    print("4. 开始抢购")
+    print("5. 手动卖出")
+    print("6. 查看持仓")
     print("0. 退出")
     print("=====================")
 
@@ -582,6 +675,101 @@ def check_dependencies():
         logger.error("请运行 setup.sh 安装所需依赖")
         return False
 
+def setup_snipe_strategy(sniper: BinanceSniper):
+    """抢开盘策略设置"""
+    print("\n=== 抢开盘策略设置 ===")
+    
+    # 1. 基础设置
+    print("\n>>> 基础参数设置")
+    symbol = get_valid_input("请输入交易对 (例如 BTC/USDT): ", str)
+    amount = get_valid_input("请输入购买数量: ")
+    
+    # 2. 买入策略
+    print("\n>>> 买入策略设置")
+    buy_type = input("选择买入方式 (1: 市价单, 2: 限价单): ")
+    price = None
+    if buy_type == "2":
+        price = get_valid_input("请输入限价单价格: ")
+    
+    # 3. 价格保护设置
+    print("\n>>> 价格保护设置")
+    print("价格保护机制说明:")
+    print("1. 最高可接受价格: 绝对价格上限，高于此价格的订单会被拒绝")
+    print("2. 参考价格: 预期的开盘价，用于计算价格偏离度")
+    print("3. 最大滑点: 允许的最大价格偏离百分比")
+    print("4. 最小深度: 要求订单簿中至少有多少个卖单才会下单")
+    print("\n注意: 以上保护措施对市价单和限价单都生效")
+    print("------------------------")
+
+    max_price = get_valid_input("设置最高可接受价格: ")
+    reference_price = get_valid_input("设置参考价格 (预期开盘价): ")
+    max_slippage = get_valid_input("设置最大滑点 (例如 0.1 表示 10%): ")
+    min_depth = get_valid_input("设置最小深度要求 (建议5个以上): ", int)
+    
+    # 显示保护设置确认
+    print("\n当前价格保护设置:")
+    print(f"1. 不会以高于 {max_price} 的价格成交")
+    print(f"2. 参考价格设为 {reference_price}，允许最高偏离 10%")
+    print(f"3. 允许的最大滑点为 {max_slippage*100}%")
+    print(f"4. 要求至少有 {min_depth} 个卖单才会下单")
+    print("\n示例: 如果最低卖价是 0.01:")
+    print(f"- 最高接受价格限制: {max_price}")
+    print(f"- 参考价格限制: {reference_price * 1.1}")
+    print(f"- 滑点限制: {0.01 * (1 + max_slippage)}")
+    print("系统将使用以上三个限制中的最小值作为实际价格上限")
+    
+    confirm = input("\n确认以上价格保护设置? (yes/no): ")
+    if confirm.lower() != 'yes':
+        print("取消设置")
+        return
+
+    # 4. 卖出策略
+    print("\n>>> 卖出策略设置")
+    take_profit = get_valid_input("设置止盈比例 (例如 0.1 表示 10%): ")
+    stop_loss = get_valid_input("设置止损比例 (例如 0.05 表示 5%): ")
+    
+    # 5. 执行参数
+    print("\n>>> 执行参数设置")
+    max_attempts = get_valid_input("设置最大尝试次数 [10]: ", int, True) or 10
+    check_interval = get_valid_input("设置检查间隔(秒) [0.2]: ", float, True) or 0.2
+
+    # 应用设置
+    sniper.setup_trading_pair(symbol, amount, price)
+    sniper.set_price_protection(max_price, reference_price, max_slippage, min_depth)
+    sniper.stop_loss = stop_loss
+    sniper.take_profit = take_profit
+    sniper.config.set_snipe_settings(max_attempts, check_interval)
+
+    # 显示设置确认
+    print("\n=== 策略设置完成 ===")
+    print_strategy(sniper)
+    input("\n按回车返回主菜单...")
+
+def print_strategy(sniper: BinanceSniper):
+    """打印当前策略"""
+    print("\n====== 当前抢币策略 ======")
+    print(f"交易对: {sniper.symbol}")
+    print(f"买入数量: {sniper.amount}")
+    print(f"买入方式: {'限价单' if sniper.price else '市价单'}")
+    if sniper.price:
+        print(f"买入价格: {sniper.price}")
+    
+    print("\n价格保护:")
+    print(f"最高接受价格: {sniper.max_price_limit}")
+    print(f"参考价格: {sniper.reference_price}")
+    print(f"最大滑点: {sniper.max_slippage*100}%")
+    print(f"最小深度: {sniper.min_depth_requirement}个订单")
+    
+    print("\n卖出策略:")
+    print(f"止盈比例: {sniper.take_profit*100}%")
+    print(f"止损比例: {sniper.stop_loss*100}%")
+    
+    max_attempts, check_interval = sniper.config.get_snipe_settings()
+    print("\n执行参数:")
+    print(f"最大尝试次数: {max_attempts}")
+    print(f"检查间隔: {check_interval}秒")
+    print("========================")
+
 def main():
     """主函数"""
     try:
@@ -594,7 +782,7 @@ def main():
 
         while True:
             print_menu()
-            choice = input("请选择操作 (0-9): ")
+            choice = input("请选择操作 (0-6): ")
 
             if choice == "1":
                 api_key = get_valid_input("请输入API Key: ", str)
@@ -603,110 +791,92 @@ def main():
                 print("API密钥设置成功!")
 
             elif choice == "2":
-                symbol = get_valid_input("请输入交易对 (例如 BTC/USDT): ", str)
-                amount = sniper.amount
-                price = sniper.price
-                sniper.setup_trading_pair(symbol, amount, price)
-                config.add_trading_pair(symbol)
-                print(f"交易对设置成功: {symbol}")
+                setup_snipe_strategy(sniper)
 
             elif choice == "3":
-                amount = get_valid_input("请输入购买数量: ")
-                if sniper.symbol:
-                    sniper.setup_trading_pair(sniper.symbol, amount, sniper.price)
-                    config.add_trading_pair(sniper.symbol, amount)
-                    print(f"购买数量设置成功: {amount}")
-                else:
-                    print("请先设置交易对")
-
-            elif choice == "4":
-                price = get_valid_input("请输入价格 (直接回车则为市价单): ", allow_empty=True)
-                if sniper.symbol and sniper.amount:
-                    sniper.setup_trading_pair(sniper.symbol, sniper.amount, price)
-                    print(f"价格设置成功: {price or '市价'}")
-                else:
-                    print("请先设置交易对和数量")
-
-            elif choice == "5":
-                max_price = get_valid_input("请输入最高可接受价格 (直接回车跳过): ", allow_empty=True)
-                reference_price = get_valid_input("请输入参考价格 (直接回车跳过): ", allow_empty=True)
-                max_slippage = get_valid_input("请输入最大滑点 (直接回车跳过): ", allow_empty=True)
-                min_depth = get_valid_input("请输入最小深度要求 (直接回车跳过): ", allow_empty=True)
-                max_gap = get_valid_input("请输入最大价格差距 (直接回车跳过): ", allow_empty=True)
-                sniper.set_price_protection(max_price, reference_price, max_slippage, min_depth, max_gap)
-                print("价格保护设置成功!")
-
-            elif choice == "6":
-                max_attempts = get_valid_input("请输入最大尝试次数 [10]: ", int, True) or 10
-                check_interval = get_valid_input("请输入检查间隔(秒) [0.2]: ", float, True) or 0.2
-                config.set_snipe_settings(max_attempts, check_interval)
-                print(f"抢购参数设置成功! 最大尝试次数: {max_attempts}, 检查间隔: {check_interval}秒")
-
-            elif choice == "7":
-                print("\n当前设置:")
-                api_key, api_secret = config.get_api_keys()
-                print(f"API Key: {'*' * len(api_key) if api_key else '未设置'}")
-                print(f"API Secret: {'*' * len(api_secret) if api_secret else '未设置'}")
-                print(f"交易对: {sniper.symbol or '未设置'}")
-                print(f"数量: {sniper.amount or '未设置'}")
-                print(f"价格: {sniper.price or '市价'}")
-                print(f"止损: {sniper.stop_loss*100}%")
-                print(f"止盈: {sniper.take_profit*100}%")
-                max_attempts, check_interval = config.get_snipe_settings()
-                print(f"最大尝试次数: {max_attempts}")
-                print(f"检查间隔: {check_interval}秒")
+                print_strategy(sniper)
                 input("\n按回车继续...")
 
-            elif choice == "8":
+            elif choice == "4":
                 if not all([sniper.symbol, sniper.amount]):
-                    print("请先完成必要设置 (交易对和数量)")
+                    print("请先完成抢购策略设置")
                     continue
+                # 开始抢购...
+                pass
 
-                print("\n开始预热系统...")
-                if not sniper.warmup():
-                    print("系统预热失败，请重试")
+            elif choice == "5":
+                if not sniper.symbol:
+                    print("请先设置交易对")
                     continue
-
-                confirm = input(f"\n确认开始抢开盘 {sniper.symbol}?\n"
-                              f"数量: {sniper.amount}\n"
-                              f"价格: {sniper.price or '市价'}\n"
-                              f"确认请输入 'yes': ")
-
-                if confirm.lower() == 'yes':
-                    print("\n等待开盘...")
-                    result = sniper.snipe()
-
-                    if result:
-                        print("\n抢购成功!")
-                        print("订单信息:", result)
-                        
-                        # 跟踪订单状态
-                        final_order = sniper.track_order(result['id'])
-                        if final_order:
-                            print(f"最终订单状态: {final_order['status']}")
-                            print(f"成交均价: {final_order.get('average', '未知')}")
-                    else:
-                        print("\n抢购失败!")
-
-                    input("\n按回车继续...")
+                    
+                position = sniper.get_position()
+                if not position or position['amount'] <= 0:
+                    print("当前没有持仓")
+                    continue
+                    
+                print("\n当前持仓:")
+                print(f"交易对: {position['symbol']}")
+                print(f"持仓数量: {position['amount']}")
+                print(f"当前价格: {position['current_price']}")
+                print(f"持仓价值: {position['value']} USDT")
+                
+                sell_amount = get_valid_input("请输入卖出数量 (全部卖出请输入 all): ", str)
+                if sell_amount.lower() == 'all':
+                    sell_amount = position['amount']
                 else:
-                    print("已取消抢购")
-
-            elif choice == "9":
-                if os.path.exists('trade_history.json'):
-                    with open('trade_history.json', 'r') as f:
-                        history = json.load(f)
-                        print("\n交易历史:")
-                        for trade in history:
-                            print(f"时间: {trade['timestamp']}")
-                            print(f"交易对: {trade['symbol']}")
-                            print(f"类型: {trade['type']}")
-                            print(f"价格: {trade['price']}")
-                            print(f"数量: {trade['amount']}")
-                            print(f"状态: {trade['status']}")
-                            print("---------------")
+                    try:
+                        sell_amount = float(sell_amount)
+                        if sell_amount > position['amount']:
+                            print("卖出数量不能大于持仓数量")
+                            continue
+                    except ValueError:
+                        print("输入无效")
+                        continue
+                
+                sell_type = input("请选择卖出方式 (1: 市价卖出, 2: 限价卖出): ")
+                
+                if sell_type == "1":
+                    confirm = input(f"\n确认以市价卖出 {sell_amount} {sniper.symbol}? (yes/no): ")
+                    if confirm.lower() == 'yes':
+                        result = sniper.place_market_sell_order(sell_amount)
+                        if result:
+                            print("\n卖出成功!")
+                            print("订单信息:", result)
+                        else:
+                            print("\n卖出失败!")
+                
+                elif sell_type == "2":
+                    price = get_valid_input("请输入卖出价格: ")
+                    confirm = input(f"\n确认以 {price} 的价格卖出 {sell_amount} {sniper.symbol}? (yes/no): ")
+                    if confirm.lower() == 'yes':
+                        result = sniper.place_limit_sell_order(sell_amount, price)
+                        if result:
+                            print("\n卖出订单提交成功!")
+                            print("订单信息:", result)
+                        else:
+                            print("\n卖出失败!")
+                
                 else:
-                    print("暂无交易历史")
+                    print("选择无效")
+                
+                input("\n按回车继续...")
+
+            elif choice == "6":
+                if not sniper.symbol:
+                    print("请先设置交易对")
+                    continue
+                    
+                position = sniper.get_position()
+                if not position:
+                    print("获取持仓信息失败")
+                    continue
+                    
+                print("\n当前持仓:")
+                print(f"交易对: {position['symbol']}")
+                print(f"持仓数量: {position['amount']}")
+                print(f"当前价格: {position['current_price']}")
+                print(f"持仓价值: {position['value']} USDT")
+                
                 input("\n按回车继续...")
 
             elif choice == "0":
