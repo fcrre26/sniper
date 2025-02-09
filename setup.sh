@@ -24,25 +24,11 @@ except ImportError:
     exit(1)
 
 try:
-    import pandas
-    print('Pandas: 已安装 ✓')
+    import websocket
+    print('WebSocket: 已安装 ✓')
 except ImportError:
-    print('Pandas: 未安装 ✗')
+    print('WebSocket: 未安装 ✗')
     exit(2)
-
-try:
-    import numpy
-    print('Numpy: 已安装 ✓')
-except ImportError:
-    print('Numpy: 未安装 ✗')
-    exit(3)
-
-try:
-    import talib
-    print('TA-Lib: 已安装 ✓')
-except ImportError:
-    print('TA-Lib: 未安装 ✗')
-    exit(4)
 "
     local check_result=$?
     
@@ -99,54 +85,9 @@ install_dependencies() {
     echo "正在安装依赖..."
     
     # 安装基本依赖
-    pip install ccxt pandas numpy
+    pip install ccxt websocket-client
     if [ $? -ne 0 ]; then
-        echo "基础依赖安装失败"
-        return $ERR_INSTALL
-    fi
-
-    # 安装TA-Lib
-    echo "安装TA-Lib..."
-    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-        # Linux
-        echo "正在下载并安装TA-Lib..."
-        wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
-        if [ $? -ne 0 ]; then
-            echo "TA-Lib下载失败"
-            return $ERR_DOWNLOAD
-        fi
-        tar -xzf ta-lib-0.4.0-src.tar.gz
-        cd ta-lib/
-        ./configure --prefix=/usr
-        make
-        sudo make install
-        if [ $? -ne 0 ]; then
-            echo "TA-Lib安装失败"
-            cd ..
-            rm -rf ta-lib ta-lib-0.4.0-src.tar.gz
-            return $ERR_INSTALL
-        fi
-        cd ..
-        rm -rf ta-lib ta-lib-0.4.0-src.tar.gz
-        pip install TA-Lib
-        if [ $? -ne 0 ]; then
-            echo "TA-Lib Python包安装失败"
-            return $ERR_INSTALL
-        fi
-    elif [[ "$OSTYPE" == "darwin"* ]]; then
-        # Mac OS
-        brew install ta-lib
-        if [ $? -ne 0 ]; then
-            echo "TA-Lib安装失败"
-            return $ERR_INSTALL
-        fi
-        pip install TA-Lib
-        if [ $? -ne 0 ]; then
-            echo "TA-Lib Python包安装失败"
-            return $ERR_INSTALL
-        fi
-    else
-        echo "请手动安装TA-Lib，参考: https://github.com/mrjbq7/ta-lib"
+        echo "依赖安装失败"
         return $ERR_INSTALL
     fi
     
@@ -293,4 +234,4 @@ while true; do
     esac
 done
 
-exit $SUCCESS 
+exit $SUCCESS
