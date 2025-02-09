@@ -84,12 +84,28 @@ download_main_program() {
 install_dependencies() {
     echo "正在安装依赖..."
     
-    # 安装基本依赖
-    pip install ccxt websocket-client
-    if [ $? -ne 0 ]; then
-        echo "依赖安装失败"
-        return $ERR_INSTALL
+    # 检查是否安装了pip
+    if ! command -v pip &> /dev/null; then
+        echo "正在安装pip..."
+        curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+        python3 get-pip.py
+        rm get-pip.py
     fi
+
+    # 安装依赖包
+    echo "正在安装依赖包..."
+    pip install ccxt
+    pip install websocket-client
+    pip install requests
+    pip install pytz
+
+    # 检查安装结果
+    echo -e "\n====== 依赖安装完成 ======"
+    echo "已安装的包版本:"
+    pip freeze | grep -E "ccxt|websocket-client|requests|pytz"
+
+    echo -e "\n如果看到以上包的版本信息，说明安装成功"
+    echo "====== 安装完成 ======"
     
     return $SUCCESS
 }
