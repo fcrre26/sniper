@@ -19,6 +19,10 @@ from functools import wraps
 import glob
 import aiohttp
 import asyncio
+import argparse
+import daemon
+import signal
+import lockfile
 
 def setup_logger():
     """配置日志"""
@@ -396,50 +400,75 @@ class BinanceSniper:
             )
     
     def sync_time(self) -> bool:
-        """同步币安服务器时间"""
+        """同步币安服务器时间（优化版 - 单次请求获取延迟和时间）"""
         try:
-            # 进行多次测试取平均值
-            offsets = []
-            for _ in range(5):
-                # 记录发送请求前的本地时间
-                request_start = time.time() * 1000
+            measurements = []
+            
+            # 进行10次测试以获得更准确的数据
+            for _ in range(10):
+                # 使用性能计数器获取更精确的时间
+                t1 = self.perf_timer() * 1000  # 发送前的本地时间
                 
-                # 获取服务器时间
+                # 单次请求获取服务器时间
                 server_time = self.query_client.fetch_time()
                 
-                # 记录收到响应的本地时间
-                response_end = time.time() * 1000
+                t2 = self.perf_timer() * 1000  # 接收到响应的本地时间
                 
-                # 计算往返延迟
-                latency = (response_end - request_start) / 2
+                # 计算这次请求的数据
+                rtt = t2 - t1  # 往返总时间
+                latency = rtt / 2  # 假设网络延迟是对称的
                 
-                # 使用延迟补偿计算实际偏移
-                actual_offset = server_time - (request_start + latency)
-                offsets.append(actual_offset)
+                # 估算服务器处理时间为t1 + latency时的时间
+                estimated_request_arrive = t1 + latency
+                time_offset = server_time - estimated_request_arrive
                 
-                time.sleep(0.1)  # 间隔100ms
+                measurements.append({
+                    'rtt': rtt,
+                    'latency': latency,
+                    'offset': time_offset,
+                    'server_time': server_time,
+                    'local_send': t1,
+                    'local_receive': t2
+                })
+                
+                time.sleep(0.1)  # 避免API限制
             
-            # 去除异常值后取平均
-            offsets.sort()
-            if len(offsets) >= 3:
-                # 去除最高和最低值
-                offsets = offsets[1:-1]
+            # 按RTT排序，取中间的几个样本（去除异常值）
+            measurements.sort(key=lambda x: x['rtt'])
+            valid_measurements = measurements[2:-2]  # 去除最高和最低的2个
             
-            self.time_offset = sum(offsets) / len(offsets)
+            # 使用最稳定的样本计算平均值
+            best_measurement = valid_measurements[0]  # RTT最小的样本
+            self.network_latency = best_measurement['latency']
+            self.time_offset = best_measurement['offset']
             
-            server_datetime = datetime.fromtimestamp((time.time() * 1000 + self.time_offset)/1000, self.timezone)
-            local_datetime = datetime.fromtimestamp(time.time(), self.timezone)
+            # 计算标准差以评估稳定性
+            latencies = [m['latency'] for m in valid_measurements]
+            offsets = [m['offset'] for m in valid_measurements]
             
-            # 添加更详细的时间偏移说明
-            offset_direction = "快" if self.time_offset < 0 else "慢"
+            latency_std = (sum((l - self.network_latency) ** 2 for l in latencies) / len(latencies)) ** 0.5
+            offset_std = (sum((o - self.time_offset) ** 2 for o in offsets) / len(offsets)) ** 0.5
+            
+            # 使用最后一次测量的服务器时间显示当前时间
+            current_measurement = measurements[-1]
+            local_time = datetime.fromtimestamp(current_measurement['local_receive']/1000, self.timezone)
+            server_time = datetime.fromtimestamp(current_measurement['server_time']/1000, self.timezone)
             
             logger.info(f"""
-=== 时间同步信息 ===
-本地时间: {local_datetime.strftime('%Y-%m-%d %H:%M:%S.%f')}
-服务器时间: {server_datetime.strftime('%Y-%m-%d %H:%M:%S.%f')}
-网络延迟: {latency:.2f}ms
-时间偏移: {abs(self.time_offset):.2f}ms (本地时间比服务器{offset_direction})
+=== 时间同步详情 ===
+本地时间: {local_time.strftime('%Y-%m-%d %H:%M:%S.%f')}
+服务器时间: {server_time.strftime('%Y-%m-%d %H:%M:%S.%f')}
+网络延迟: {self.network_latency:.2f}ms (标准差: {latency_std:.2f}ms)
+时间偏移: {self.time_offset:.2f}ms (标准差: {offset_std:.2f}ms)
 时间状态: {'正常' if abs(self.time_offset) < 1000 else '需要同步'}
+样本数量: {len(valid_measurements)}
+测量稳定性: {'良好' if latency_std < 10 and offset_std < 10 else '一般'}
+
+详细分析:
+- 往返时间(RTT): {best_measurement['rtt']:.2f}ms
+- 请求发送时间: {datetime.fromtimestamp(best_measurement['local_send']/1000, self.timezone).strftime('%H:%M:%S.%f')}
+- 请求接收时间: {datetime.fromtimestamp(best_measurement['local_receive']/1000, self.timezone).strftime('%H:%M:%S.%f')}
+- 服务器时间点: {datetime.fromtimestamp(best_measurement['server_time']/1000, self.timezone).strftime('%H:%M:%S.%f')}
 """)
             
             return True
@@ -950,27 +979,74 @@ class BinanceSniper:
 """)
 
     def snipe(self):
-        """开始抢购"""
+        """开始抢购（包含自动预热和准备）"""
         try:
-            # 检查API延迟和余额
             if not self.check_balance():
                 return None
 
-            # 目标时间就是用户设置的开盘时间（币安服务器时间）
-            target_server_time = self.opening_time.timestamp() * 1000
+            # 计算距离开盘的时间
+            current_time = datetime.now(self.timezone)
+            time_to_open = (self.opening_time - current_time).total_seconds()
+
+            logger.info(f"""
+=== 开始自动抢购流程 ===
+目标开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
+当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}
+距离开盘: {time_to_open:.1f}秒
+""")
+
+            # 预热阶段（如果时间充足）
+            if time_to_open > 300:  # 如果距离开盘超过5分钟
+                logger.info("等待进入预热阶段...")
+                time.sleep(time_to_open - 300)  # 等待到开盘前5分钟
+                
+            # 开始系统预热
+            logger.info("开始系统预热...")
+            self.warmup()
             
-            # 计算本地应该什么时候发送订单
+            # 准备阶段：定期同步时间直到接近开盘
+            last_sync = 0
+            while True:
+                current_time = datetime.now(self.timezone)
+                time_to_open = (self.opening_time - current_time).total_seconds()
+                
+                # 进入最终执行阶段
+                if time_to_open <= 10:
+                    logger.info("进入最终执行阶段...")
+                    break
+                    
+                # 每30秒同步一次时间
+                if time.time() - last_sync >= 30:
+                    logger.info(f"距离开盘还有: {time_to_open:.1f} 秒")
+                    self.sync_time()
+                    last_sync = time.time()
+                    
+                # 开盘前2分钟显示详细状态
+                if time_to_open <= 120:
+                    logger.info(f"""
+=== 抢购准备状态 ===
+距离开盘: {time_to_open:.1f}秒
+网络延迟: {self.network_latency:.2f}ms
+时间偏移: {self.time_offset:.2f}ms
+系统状态: {'正常' if abs(self.time_offset) < 1000 else '需要同步'}
+""")
+                
+                time.sleep(1)
+
+            # 最后一次时间同步
+            self.sync_time()
+            
+            # 计算发送时间
+            target_server_time = self.opening_time.timestamp() * 1000
             send_advance_time = (
                 self.network_latency +  # 网络延迟补偿
                 abs(self.time_offset) + # 时间偏移补偿
-                10  # 额外安全余量(10ms)
+                10  # 额外安全余量
             )
-            
-            # 计算本地发送时间
             local_send_time = target_server_time - send_advance_time
             
             logger.info(f"""
-=== 抢购执行计划 ===
+=== 最终执行计划 ===
 目标服务器时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S.%f')}
 本地发送时间: {datetime.fromtimestamp(local_send_time/1000, self.timezone).strftime('%Y-%m-%d %H:%M:%S.%f')}
 提前量分析:
@@ -981,25 +1057,23 @@ class BinanceSniper:
 并发订单数: {self.concurrent_orders}
 """)
 
-            # 等待直到接近发送时间
+            # 等待并发送订单
             while True:
                 current_local_time = time.time() * 1000
                 if current_local_time >= local_send_time:
-                    # 并发发送多个订单
+                    # 并发发送订单
                     orders = []
                     threads = []
-                    order_ids = set()  # 记录所有订单ID
+                    order_ids = set()
                     
-                    # 创建多个下单线程
-                    for i in range(self.concurrent_orders):
+                    start_time = time.time() * 1000
+                    
+                    # 创建并启动所有下单线程
+                    for _ in range(self.concurrent_orders):
                         thread = threading.Thread(
                             target=lambda: self._place_order_and_collect(orders, order_ids)
                         )
                         threads.append(thread)
-                    
-                    # 同时启动所有线程
-                    start_time = time.time() * 1000
-                    for thread in threads:
                         thread.start()
                     
                     # 等待所有订单完成
@@ -1020,11 +1094,11 @@ class BinanceSniper:
 """)
                     
                     return success_order
-                    
+                
                 time.sleep(0.0001)  # 0.1ms的检查间隔
 
         except Exception as e:
-            logger.error(f"抢购失败: {str(e)}")
+            logger.error(f"抢购过程发生错误: {str(e)}")
             return None
 
     def _place_order_and_collect(self, orders: list, order_ids: set):
@@ -1387,6 +1461,150 @@ class BinanceSniper:
         """确保资源被正确清理"""
         self.cleanup()
 
+    def prepare_and_snipe(self):
+        """准备并执行抢购"""
+        try:
+            if not self.opening_time:
+                logger.error("未设置开盘时间")
+                return None
+
+            # 计算距离开盘的时间
+            current_time = datetime.now(self.timezone)
+            time_to_open = (self.opening_time - current_time).total_seconds()
+
+            logger.info(f"""
+=== 抢购准备开始 ===
+目标开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
+当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}
+距离开盘: {time_to_open:.1f}秒
+""")
+
+            # 如果距离开盘超过5分钟，等待到提前5分钟
+            if time_to_open > 300:
+                wait_time = time_to_open - 300
+                logger.info(f"等待 {wait_time:.1f} 秒后开始系统预热...")
+                time.sleep(wait_time)
+
+            # 系统预热
+            logger.info("开始系统预热...")
+            self.warmup()
+
+            # 开始定期同步时间
+            last_sync = 0
+            while True:
+                current_time = datetime.now(self.timezone)
+                time_to_open = (self.opening_time - current_time).total_seconds()
+
+                # 如果距离开盘小于10秒，进入最终准备阶段
+                if time_to_open <= 10:
+                    logger.info("""
+=== 进入最终准备阶段 ===
+- 执行最后一次时间同步
+- 准备订单参数
+- 等待精确时间发送
+""")
+                    # 最后一次时间同步
+                    self.sync_time()
+                    # 开始抢购
+                    return self.snipe()
+
+                # 每30秒同步一次时间
+                if time.time() - last_sync >= 30:
+                    logger.info(f"距离开盘还有: {time_to_open:.1f} 秒")
+                    self.sync_time()
+                    last_sync = time.time()
+
+                # 在开盘前2分钟，显示更详细的信息
+                if time_to_open <= 120:
+                    logger.info(f"""
+=== 抢购准备状态 ===
+距离开盘: {time_to_open:.1f}秒
+网络延迟: {self.network_latency:.2f}ms
+时间偏移: {self.time_offset:.2f}ms
+系统状态: {'正常' if abs(self.time_offset) < 1000 else '需要同步'}
+""")
+
+                time.sleep(1)
+
+        except KeyboardInterrupt:
+            logger.info("程序被用户中断")
+            return None
+        except Exception as e:
+            logger.error(f"准备过程发生错误: {str(e)}")
+            return None
+
+    def setup_snipe_strategy(self):
+        """设置抢购策略"""
+        try:
+            logger.info("开始设置抢购策略...")
+            
+            # 1. 基础设置
+            print("\n>>> 基础参数设置")
+            symbol = get_valid_input("请输入交易对 (例如 BTC/USDT): ", str)
+            total_usdt = get_valid_input("请输入买入金额(USDT): ", float)
+            
+            # 2. 价格保护设置
+            print("\n>>> 价格保护设置")
+            print("价格保护机制说明:")
+            print("1. 最高接受单价: 绝对价格上限，无论如何都不会超过此价格")
+            print("2. 开盘价倍数: 相对于第一档价格的最大倍数")
+            print("3. 使用IOC限价单，超出价格自动取消")
+            
+            max_price = get_valid_input("设置最高接受单价 (例如 0.05 USDT): ", float)
+            price_multiplier = get_valid_input("设置开盘价倍数 (例如 3 表示最高接受开盘价的3倍): ", float)
+            
+            # 3. 并发和时间设置
+            print("\n>>> 执行参数设置")
+            concurrent_orders = get_valid_input("并发订单数量 (建议1-5): ", int)
+            advance_time = get_valid_input("提前下单时间(ms) (建议50-200): ", int)
+            
+            # 4. 止盈止损设置
+            print("\n>>> 止盈止损设置")
+            stop_loss = get_valid_input("止损比例 (例如 0.05 表示 5%): ", float)
+            take_profit = get_valid_input("止盈比例 (例如 0.1 表示 10%): ", float)
+            
+            # 应用设置
+            self.setup_trading_pair(symbol, total_usdt)
+            self.set_price_protection(max_price, price_multiplier)
+            self.set_snipe_params(advance_time, concurrent_orders)
+            self.set_profit_strategy(take_profit, stop_loss)
+            
+            # 显示设置结果
+            logger.info(f"""
+=== 抢购策略设置完成 ===
+基础参数:
+- 交易对: {symbol}
+- 买入金额: {total_usdt} USDT
+
+价格保护:
+- 最高接受价格: {max_price} USDT
+- 开盘价倍数: {price_multiplier}倍
+
+执行参数:
+- 并发订单数: {concurrent_orders}
+- 提前下单时间: {advance_time}ms
+
+止盈止损:
+- 止损比例: {stop_loss*100}%
+- 止盈比例: {take_profit*100}%
+""")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"设置抢购策略失败: {str(e)}")
+            return False
+
+    def set_profit_strategy(self, take_profit: float, stop_loss: float):
+        """设置止盈止损策略"""
+        self.take_profit = take_profit
+        self.stop_loss = stop_loss
+        logger.info(f"""
+=== 止盈止损策略设置 ===
+止盈比例: {take_profit*100}%
+止损比例: {stop_loss*100}%
+""")
+
 def print_menu():
     """打印主菜单"""
     print("\n=== 币安现货抢币工具 ===")
@@ -1583,43 +1801,149 @@ def print_strategy(sniper: BinanceSniper):
     print(f"检查间隔: {check_interval}秒")
     print("========================")
 
-def main():
-    """主函数"""
+def run_as_daemon():
+    """以守护进程方式运行"""
     try:
-        # 检查依赖
-        if not check_dependencies():
-            logger.error("依赖检查失败，程序退出")
-            return
+        # 获取当前工作目录
+        work_dir = os.getcwd()
+        
+        # 创建PID文件目录
+        pid_dir = '/var/run/binance-sniper'
+        if not os.path.exists(pid_dir):
+            os.makedirs(pid_dir, mode=0o755)
+        
+        # 配置守护进程上下文
+        context = daemon.DaemonContext(
+            working_directory=work_dir,  # 使用当前目录
+            umask=0o002,
+            pidfile=lockfile.FileLock('/var/run/binance-sniper/sniper.pid'),
+            signal_map={
+                signal.SIGTERM: lambda signo, frame: cleanup_and_exit(),
+                signal.SIGINT: lambda signo, frame: cleanup_and_exit(),
+                signal.SIGHUP: lambda signo, frame: None,  # 忽略SIGHUP信号
+            }
+        )
+        
+        # 确保日志目录存在
+        log_dir = '/var/log/binance-sniper'
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir, mode=0o755)
+        
+        # 启动守护进程
+        with context:
+            logger.info("Binance Sniper守护进程已启动")
+            logger.info(f"工作目录: {work_dir}")
+            logger.info(f"PID文件: {pid_dir}/sniper.pid")
+            main_loop()
             
-        logger.info("""
-====== 币安现货抢币工具启动 ======
-版本: 1.0.0
-时间: %s
-===============================""", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    except Exception as e:
+        logger.error(f"守护进程启动失败: {str(e)}")
+        sys.exit(1)
 
-        # 初始化配置
-        try:
-            config = ConfigManager()
-            logger.info("配置管理器初始化成功")
-        except Exception as e:
-            logger.error("配置管理器初始化失败: %s", str(e))
-            return
+def cleanup_and_exit():
+    """清理资源并退出"""
+    logger.info("正在关闭守护进程...")
+    # 执行清理操作
+    sys.exit(0)
 
-        # 初始化抢币工具
-        try:
-            sniper = BinanceSniper(config)
-            logger.info("抢币工具初始化成功")
-        except Exception as e:
-            logger.error("抢币工具初始化失败: %s", str(e))
-            return
+def main_loop():
+    """主循环"""
+    try:
+        config = ConfigManager()
+        with BinanceSniper(config) as sniper:
+            # 从配置文件读取策略
+            sniper.load_strategy()
+            
+            # 等待开盘时间
+            while True:
+                if sniper.is_ready_to_snipe():
+                    result = sniper.snipe()
+                    if result:
+                        logger.info(f"""
+=== 抢购成功 ===
+订单ID: {result['id']}
+成交价格: {result['average']}
+成交数量: {result['filled']}
+成交金额: {result['cost']} USDT
+""")
+                    else:
+                        logger.error("抢购失败")
+                        
+                time.sleep(1)
+                
+    except Exception as e:
+        logger.error(f"主循环发生错误: {str(e)}")
+        return
 
-        # 主循环
-        while True:
-            try:
+def main():
+    try:
+        config = ConfigManager()
+        with BinanceSniper(config) as sniper:
+            while True:
                 print_menu()
                 choice = input("请选择操作 (0-6): ")
 
-                if choice == "0":
+                if choice == "2":  # 抢购策略设置
+                    logger.info("用户选择设置抢购策略")
+                    if sniper.setup_snipe_strategy():
+                        print("\n策略设置成功!")
+                        
+                        # 测试API延迟
+                        print("\n正在测试API延迟...")
+                        latency, status = sniper.test_api_latency()
+                        print(f"API延迟: {latency:.2f}ms [{status}]")
+                        
+                        if latency > 200:
+                            print("\n警告: 当前网络延迟较高，可能影响抢购成功率")
+                            print("建议:")
+                            print("1. 检查网络连接")
+                            print("2. 使用更好的网络环境")
+                            print("3. 增加提前下单时间")
+                    else:
+                        print("\n策略设置失败，请重试")
+                    
+                    input("\n按回车继续...")
+                    continue
+
+                elif choice == "4":  # 开始抢购
+                    if not sniper.symbol or not sniper.amount:
+                        print("请先完成抢购策略设置（选项2）")
+                        continue
+                    
+                    if not sniper.opening_time:
+                        print("\n请设置开盘时间（东八区）")
+                        try:
+                            year = get_valid_input("年 (例如 2024): ", int)
+                            month = get_valid_input("月 (1-12): ", int)
+                            day = get_valid_input("日 (1-31): ", int)
+                            hour = get_valid_input("时 (0-23): ", int)
+                            minute = get_valid_input("分 (0-59): ", int)
+                            second = get_valid_input("秒 (0-59): ", int)
+                            
+                            opening_time = datetime(year, month, day, hour, minute, second)
+                            sniper.set_opening_time(opening_time)
+                        except ValueError as e:
+                            print(f"时间设置错误: {str(e)}")
+                            continue
+                    
+                    print("\n开始执行抢购...")
+                    result = sniper.snipe()  # 这里会自动执行预热和准备流程
+                    
+                    if result:
+                        print(f"""
+=== 抢购成功! ===
+订单ID: {result['id']}
+成交价格: {result['average']}
+成交数量: {result['filled']}
+成交金额: {result['cost']} USDT
+""")
+                    else:
+                        print("\n抢购失败或被中断")
+                    
+                    input("\n按回车继续...")
+                    continue
+
+                elif choice == "0":
                     logger.info("用户选择退出程序")
                     print("\n感谢使用，再见!")
                     break
@@ -1717,22 +2041,10 @@ def main():
                     
                     input("\n按回车继续...")
 
-                elif choice == "2":
-                    logger.info("用户选择设置抢购策略")
-                    setup_snipe_strategy(sniper)
-
                 elif choice == "3":
                     logger.info("用户选择查看当前策略")
                     print_strategy(sniper)
                     input("\n按回车继续...")
-
-                elif choice == "4":
-                    logger.info("用户选择开始抢购")
-                    if not all([sniper.symbol, sniper.amount]):
-                        logger.warning("抢购参数未设置完整")
-                        print("请先完成抢购策略设置")
-                    continue
-                    # ... 抢购代码 ...
 
                 elif choice == "5":
                     logger.info("用户选择手动卖出")
@@ -1755,19 +2067,14 @@ def main():
                     logger.warning("用户输入无效选项: %s", choice)
                     print("选择无效，请重试")
 
-            except KeyboardInterrupt:
-                logger.info("用户中断程序")
-                print("\n程序已中断")
-                break
-            except Exception as e:
-                logger.error("主循环发生错误: %s", str(e))
-                print(f"\n发生错误: {str(e)}")
-                print("程序将继续运行...")
-                continue
-
+    except KeyboardInterrupt:
+        logger.info("用户中断程序")
+        print("\n程序已中断")
+        return
     except Exception as e:
-        logger.critical("程序发生致命错误: %s", str(e))
-        print(f"\n程序发生致命错误: {str(e)}")
+        logger.error("主循环发生错误: %s", str(e))
+        print(f"\n发生错误: {str(e)}")
+        print("程序将继续运行...")
         return
 
     finally:
@@ -1775,10 +2082,11 @@ def main():
 
 
 if __name__ == '__main__':
-    try:
+    parser = argparse.ArgumentParser(description='Binance Sniper')
+    parser.add_argument('--daemon', action='store_true', help='以守护进程方式运行')
+    args = parser.parse_args()
+    
+    if args.daemon:
+        run_as_daemon()
+    else:
         main()
-    except Exception as e:
-        logger.critical("程序异常退出: %s", str(e))
-    finally:
-        # 清理工作
-        logging.shutdown()
