@@ -29,6 +29,27 @@ try:
 except ImportError:
     print('WebSocket: 未安装 ✗')
     exit(2)
+
+try:
+    import requests
+    print('Requests: 已安装 ✓')
+except ImportError:
+    print('Requests: 未安装 ✗')
+    exit(3)
+
+try:
+    import pytz
+    print('PyTZ: 已安装 ✓')
+except ImportError:
+    print('PyTZ: 未安装 ✗')
+    exit(4)
+
+try:
+    import aiohttp
+    print('AIOHTTP: 已安装 ✓')
+except ImportError:
+    print('AIOHTTP: 未安装 ✗')
+    exit(5)
 "
     local check_result=$?
     
@@ -94,15 +115,19 @@ install_dependencies() {
 
     # 安装依赖包
     echo "正在安装依赖包..."
-    pip install ccxt
-    pip install websocket-client
-    pip install requests
-    pip install pytz
+    pip install ccxt                # 加密货币交易所API
+    pip install websocket-client    # WebSocket客户端
+    pip install requests           # HTTP请求库
+    pip install pytz              # 时区处理
+    pip install aiohttp           # 异步HTTP客户端
+    pip install urllib3           # HTTP客户端（requests的依赖）
+    pip install cryptography      # 加密库（可能需要）
+    pip install python-dateutil   # 日期处理
 
     # 检查安装结果
     echo -e "\n====== 依赖安装完成 ======"
     echo "已安装的包版本:"
-    pip freeze | grep -E "ccxt|websocket-client|requests|pytz"
+    pip freeze | grep -E "ccxt|websocket-client|requests|pytz|aiohttp|urllib3|cryptography|python-dateutil"
 
     echo -e "\n如果看到以上包的版本信息，说明安装成功"
     echo "====== 安装完成 ======"
