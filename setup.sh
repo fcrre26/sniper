@@ -1,20 +1,49 @@
 #!/bin/bash
 
-# 安装系统依赖
-if [ "$(uname)" == "Darwin" ]; then
-    # MacOS
-    brew install ta-lib
-elif [ "$(expr substr $(uname -s) 1 5)" == "Linux" ]; then
-    # Linux
-    wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
-    tar -xvf ta-lib-0.4.0-src.tar.gz
-    cd ta-lib/
-    ./configure --prefix=/usr
-    make
-    sudo make install
-    cd ..
-    rm -rf ta-lib-0.4.0-src.tar.gz ta-lib/
+echo "开始安装依赖..."
+
+# 检查pip是否安装
+if ! command -v pip &> /dev/null; then
+    echo "正在安装pip..."
+    curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+    python get-pip.py
 fi
+
+# 安装基本依赖
+echo "安装Python依赖..."
+pip install ccxt pandas numpy
+
+# 安装TA-Lib
+echo "安装TA-Lib..."
+if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+    # Linux
+    sudo apt-get update
+    sudo apt-get install -y build-essential
+    sudo apt-get install -y python3-dev
+    sudo apt-get install -y ta-lib
+    pip install TA-Lib
+elif [[ "$OSTYPE" == "darwin"* ]]; then
+    # Mac OS
+    brew install ta-lib
+    pip install TA-Lib
+else
+    echo "请手动安装TA-Lib，参考: https://github.com/mrjbq7/ta-lib"
+fi
+
+# 检查安装结果
+echo "检查依赖安装..."
+python3 -c "
+try:
+    import ccxt
+    import pandas
+    import numpy
+    import talib
+    print('所有依赖安装成功!')
+except ImportError as e:
+    print(f'依赖安装失败: {str(e)}')
+"
+
+echo "安装完成!"
 
 # 创建虚拟环境
 python -m venv venv
