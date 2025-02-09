@@ -6,7 +6,6 @@ import json
 import os
 import pandas as pd
 import numpy as np
-import talib
 import threading
 import sys
 from logging.handlers import RotatingFileHandler
@@ -49,13 +48,7 @@ def setup_logger():
 # 创建logger实例
 logger = setup_logger()
 
-# 添加依赖检查
-try:
-    import talib
-except ImportError:
-    logger.error("请安装 TA-Lib: pip install ta-lib")
-    raise
-
+# 删除TA-Lib依赖检查
 try:
     import pandas as pd
     import numpy as np
@@ -211,7 +204,7 @@ class ConfigManager:
         return (
             int(self.config['SNIPE'].get('max_attempts', 10)),
             float(self.config['SNIPE'].get('check_interval', 0.2))
-        )
+)
 
 class BinanceSniper:
     def __init__(self, config: ConfigManager):
@@ -276,8 +269,8 @@ class BinanceSniper:
     def setup_trading_pair(self, symbol: str, amount: float) -> None:
         """设置交易参数"""
         try:
-            self.symbol = symbol
-            self.amount = amount
+        self.symbol = symbol
+        self.amount = amount
             logger.info(f"""
 === 设置交易参数 ===
 交易对: {symbol}
@@ -549,8 +542,8 @@ class BinanceSniper:
 卖出金额: {sell_order['cost']} USDT
 订单ID: {sell_order['id']}
 """)
-                        break
-                
+                    break
+                    
                 # 阶梯止盈检查
                 for i, (profit_target, sell_percent) in enumerate(self.sell_ladders):
                     if i not in sold_ladders and profit_ratio >= profit_target:
@@ -578,7 +571,7 @@ class BinanceSniper:
 """)
                             remaining_amount -= sell_amount
                             sold_ladders.add(i)
-                
+                    
                 time.sleep(1)
                 
             # 交易完成后的统计
@@ -1047,9 +1040,6 @@ def check_dependencies():
         import numpy as np
         logger.info(f"Numpy版本: {np.__version__}")
         
-        import talib
-        logger.info(f"TA-Lib已安装")
-        
         return True
     except ImportError as e:
         logger.error(f"依赖检查失败: {str(e)}")
@@ -1217,7 +1207,7 @@ def main():
                     if not all([sniper.symbol, sniper.amount]):
                         logger.warning("抢购参数未设置完整")
                         print("请先完成抢购策略设置")
-                        continue
+                    continue
                     # ... 抢购代码 ...
 
                 elif choice == "5":
@@ -1236,7 +1226,7 @@ def main():
                         print("获取持仓信息失败")
                         continue
                     # ... 显示持仓代码 ...
-
+                
                 else:
                     logger.warning("用户输入无效选项: %s", choice)
                     print("选择无效，请重试")
@@ -1265,7 +1255,6 @@ if __name__ == '__main__':
         main()
     except Exception as e:
         logger.critical("程序异常退出: %s", str(e))
-        print(f"\n程序异常退出: {str(e)}")
     finally:
         # 清理工作
         logging.shutdown()
