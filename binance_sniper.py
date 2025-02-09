@@ -1028,109 +1028,138 @@ class BinanceSniper:
 并发订单数量: {concurrent_orders}
 """)
 
+    def _continuous_market_data_fetch(self, start_time: float, duration_ms: int = 1000) -> List[Dict]:
+        """持续获取市场数据
+        Args:
+            start_time: 开始时间戳(ms)
+            duration_ms: 持续时间(ms)
+        Returns:
+            List[Dict]: 获取到的市场数据列表
+        """
+        market_data_list = []
+        end_time = start_time + duration_ms
+        
+        def fetch_worker():
+            while time.perf_counter() * 1000 < end_time:
+                try:
+                    depth = self.query_client.fetch_order_book(self.symbol, limit=5)
+                    if depth and depth.get('asks'):
+                        market_data = {
+                            'first_ask': depth['asks'][0][0],
+                            'timestamp': depth['timestamp'],
+                            'local_time': time.perf_counter() * 1000
+                        }
+                        market_data_list.append(market_data)
+                except Exception as e:
+                    logger.error(f"获取市场数据失败: {str(e)}")
+                
+                # 尽可能快速地继续请求
+                time.sleep(0.001)  # 1ms的最小间隔
+        
+        # 创建多个获取线程
+        fetch_threads = []
+        for _ in range(3):  # 使用3个线程并发获取
+            thread = threading.Thread(target=fetch_worker)
+            thread.daemon = True
+            fetch_threads.append(thread)
+            thread.start()
+        
+        # 等待所有线程完成
+        for thread in fetch_threads:
+            thread.join()
+        
+        return market_data_list
+
+    def _execute_snipe_orders(self, market_data: Dict):
+        """执行抢购订单
+        Args:
+            market_data: 市场数据
+        """
+        orders = []
+        threads = []
+        order_ids = set()
+        
+        def order_worker():
+            try:
+                order = self.place_market_order()
+                if order and order.get('id'):
+                    with threading.Lock():
+                        orders.append(order)
+                        order_ids.add(order['id'])
+                    logger.info(f"订单已提交: {order['id']}")
+            except Exception as e:
+                logger.error(f"下单失败: {str(e)}")
+        
+        # 并发发送订单
+        for _ in range(self.concurrent_orders):
+            thread = threading.Thread(target=order_worker)
+            thread.daemon = True
+            threads.append(thread)
+            thread.start()
+        
+        # 等待所有订单完成
+        for thread in threads:
+            thread.join(timeout=0.5)  # 设置较短的超时时间
+        
+        return orders, order_ids
+
     def snipe(self):
-        """开始抢购（包含自动预热和准备）"""
-        self.perf.start('total_snipe')
+        """执行抢购"""
         try:
-            # 1. 系统预热
-            self.perf.start('warmup')
-            logger.info("开始系统预热...")
-            if not self.warmup():
-                logger.error("系统预热失败")
+            # 1. 计算关键时间点
+            target_time = self.opening_time.timestamp() * 1000
+            network_latency = self.network_latency
+            
+            # 2. 计算市场数据获取时间
+            # 提前 network_latency + 20ms(处理时间) 开始获取数据
+            fetch_start_time = target_time - (network_latency + 20)
+            
+            # 3. 持续获取市场数据
+            logger.info(f"开始获取市场数据, 提前量: {network_latency + 20:.2f}ms")
+            market_data_list = self._continuous_market_data_fetch(
+                fetch_start_time,
+                duration_ms=network_latency + 100  # 持续时间比提前量多一点
+            )
+            
+            if not market_data_list:
+                logger.error("未能获取到市场数据")
                 return None
-            warmup_time = self.perf.stop('warmup')
-            logger.info(f"系统预热完成: {warmup_time:.2f}ms")
             
-            # 2. 时间同步
-            self.perf.start('time_sync')
-            logger.info("开始时间同步...")
-            if not self.sync_time():
-                logger.error("时间同步失败")
+            # 4. 选择最新的市场数据
+            latest_data = max(market_data_list, key=lambda x: x['timestamp'])
+            
+            # 5. 检查价格
+            if latest_data['first_ask'] > self.max_price:
+                logger.warning(f"卖一价({latest_data['first_ask']})超过最高接受价格({self.max_price})")
                 return None
-            sync_time = self.perf.stop('time_sync')
-            logger.info(f"时间同步完成: {sync_time:.2f}ms")
             
-            # 3. 网络优化
-            self.perf.start('network_optimization')
-            logger.info("开始网络优化...")
-            if not self.optimize_network_connection():
-                logger.warning("网络优化失败，继续执行")
-            network_time = self.perf.stop('network_optimization')
-            logger.info(f"网络优化完成: {network_time:.2f}ms")
+            # 6. 执行订单
+            logger.info("开始执行订单")
+            orders, order_ids = self._execute_snipe_orders(latest_data)
             
-            # 4. 服务器选择
-            self.perf.start('server_selection')
-            logger.info("开始选择最佳服务器...")
-            server_results = self.test_server_latency()
-            server_time = self.perf.stop('server_selection')
-            logger.info(f"服务器选择完成: {server_time:.2f}ms")
-            
-            # 5. 等待开盘
-            current_time = datetime.now(self.timezone)
-            time_to_open = (self.opening_time - current_time).total_seconds()
-            
-            if time_to_open > 0:
-                logger.info(f"等待开盘，剩余 {time_to_open:.1f} 秒")
-                time.sleep(max(0, time_to_open - 1))  # 提前1秒开始准备
-            
-            # 6. 开始抢购执行
-            self.perf.start('order_execution')
-            logger.info("开始执行抢购...")
-            
-            # 创建多个并发订单
-            orders = []
-            threads = []
-            order_ids = set()
-            
-            # 记录开始时间
-            execution_start = time.perf_counter()
-            
-            # 并发发送订单
-            for i in range(self.concurrent_orders):
-                thread = threading.Thread(
-                    target=lambda: self._place_order_and_collect(orders, order_ids)
-                )
-                threads.append(thread)
-                thread.start()
-            
-            # 等待所有订单完成
-            for thread in threads:
-                thread.join(timeout=1.0)
-            
-            # 处理订单结果
+            # 7. 处理订单结果
             success_order = self._handle_orders(order_ids)
             
-            execution_time = self.perf.stop('order_execution')
-            total_time = self.perf.stop('total_snipe')
-            
-            # 打印性能统计
+            # 8. 记录性能数据
+            data_fetch_times = [data['local_time'] - fetch_start_time for data in market_data_list]
             logger.info(f"""
-=== 抢购执行完成 ===
-总耗时: {total_time:.2f}ms
-- 系统预热: {warmup_time:.2f}ms
-- 时间同步: {sync_time:.2f}ms
-- 网络优化: {network_time:.2f}ms
-- 服务器选择: {server_time:.2f}ms
-- 订单执行: {execution_time:.2f}ms
+=== 性能统计 ===
+市场数据获取:
+- 获取次数: {len(market_data_list)}
+- 最小延迟: {min(data_fetch_times):.2f}ms
+- 最大延迟: {max(data_fetch_times):.2f}ms
+- 平均延迟: {sum(data_fetch_times)/len(data_fetch_times):.2f}ms
 
-订单统计:
+订单执行:
 - 发送订单数: {len(order_ids)}
 - 成功订单数: {1 if success_order else 0}
-- 订单延迟: {(time.perf_counter() - execution_start) * 1000:.2f}ms
 """)
-            
-            # 打印详细性能统计
-            self.perf.print_summary()
             
             return success_order
             
         except Exception as e:
-            logger.exception("抢购过程发生错误")
+            logger.exception("抢购执行失败")
             return None
-        finally:
-            # 确保停止所有计时器
-            for operation in list(self.perf.start_times.keys()):
-                self.perf.stop(operation)
 
     def _place_order_and_collect(self, orders: list, order_ids: set):
         """下单并收集订单ID"""
@@ -1388,76 +1417,288 @@ class BinanceSniper:
         """确保资源被正确清理"""
         self.cleanup()
 
+    def _warm_up_system(self) -> bool:
+        """系统预热
+        Returns:
+            bool: 预热是否成功
+        """
+        self.perf.start('warm_up')
+        try:
+            logger.info("开始系统预热...")
+            
+            # 1. 检查账户余额
+            if not self.check_balance():
+                raise ValueError("账户余额不足")
+                
+            # 2. 预加载市场信息
+            self.query_client.load_markets()
+            
+            # 3. 预热API连接
+            self.query_client.fetch_ticker(self.symbol)
+            self.trade_client.fetch_balance()
+            
+            # 4. 预创建WebSocket连接
+            self._init_websocket_connection()
+            
+            warm_up_time = self.perf.stop('warm_up')
+            logger.info(f"系统预热完成: {warm_up_time:.2f}ms")
+            return True
+            
+        except Exception as e:
+            logger.error(f"系统预热失败: {str(e)}")
+            return False
+
+    def _prepare_sessions(self) -> bool:
+        """准备API会话
+        Returns:
+            bool: 会话准备是否成功
+        """
+        self.perf.start('prepare_sessions')
+        try:
+            # 1. 优化连接池设置
+            self.trade_session.mount('https://', HTTPAdapter(
+                pool_connections=50,
+                pool_maxsize=50,
+                max_retries=self.RETRY_ATTEMPTS,
+                pool_block=False
+            ))
+            
+            # 2. 设置会话参数
+            self.trade_session.headers.update({
+                'Content-Type': 'application/json',
+                'User-Agent': 'BinanceSniper/1.0',
+                'X-MBX-APIKEY': self.trade_client.apiKey
+            })
+            
+            # 3. 预创建查询会话
+            self.query_session.headers.update({
+                'Content-Type': 'application/json',
+                'User-Agent': 'BinanceSniper/1.0',
+                'X-MBX-APIKEY': self.query_client.apiKey
+            })
+            
+            prep_time = self.perf.stop('prepare_sessions')
+            logger.info(f"会话准备完成: {prep_time:.2f}ms")
+            return True
+            
+        except Exception as e:
+            logger.error(f"会话准备失败: {str(e)}")
+            return False
+
+    def _prepare_order_params(self) -> dict:
+        """准备订单参数
+        Returns:
+            dict: 预准备的订单参数
+        """
+        self.perf.start('prepare_params')
+        try:
+            # 1. 基础订单参数
+            params = {
+                'symbol': self.symbol.replace('/', ''),
+                'side': 'BUY',
+                'type': 'MARKET',
+                'quantity': self.amount,
+            }
+            
+            # 2. 准备签名参数
+            timestamp = int(time.time() * 1000)
+            params['timestamp'] = timestamp
+            signature = self._generate_signature(params)
+            params['signature'] = signature
+            
+            prep_time = self.perf.stop('prepare_params')
+            logger.info(f"参数准备完成: {prep_time:.2f}ms")
+            return params
+            
+        except Exception as e:
+            logger.error(f"参数准备失败: {str(e)}")
+            return None
+
+    def _final_time_sync(self) -> Tuple[float, float]:
+        """最终时间同步
+        Returns:
+            Tuple[float, float]: (网络延迟, 时间偏移)
+        """
+        self.perf.start('final_sync')
+        try:
+            latencies = []
+            offsets = []
+            
+            # 进行多次同步取最优值
+            for _ in range(5):
+                start = time.perf_counter()
+                server_time = self.query_client.fetch_time()
+                end = time.perf_counter()
+                
+                latency = (end - start) * 1000 / 2  # 单向延迟
+                offset = server_time - (start * 1000 + latency)
+                
+                latencies.append(latency)
+                offsets.append(offset)
+                
+                time.sleep(0.1)  # 间隔100ms
+                
+            # 使用最优值
+            best_latency = min(latencies)
+            avg_offset = sum(offsets) / len(offsets)
+            
+            sync_time = self.perf.stop('final_sync')
+            logger.info(f"""
+最终时间同步完成: {sync_time:.2f}ms
+- 网络延迟: {best_latency:.2f}ms
+- 时间偏移: {avg_offset:.2f}ms
+""")
+            return best_latency, avg_offset
+            
+        except Exception as e:
+            logger.error(f"最终时间同步失败: {str(e)}")
+            return None
+
+    def _calculate_send_time(self, sync_results: Tuple[float, float]) -> float:
+        """计算订单发送时间
+        Args:
+            sync_results: (网络延迟, 时间偏移)
+        Returns:
+            float: 发送时间戳(ms)
+        """
+        if not sync_results:
+            return None
+            
+        network_latency, time_offset = sync_results
+        
+        # 计算发送时间
+        target_time = self.opening_time.timestamp() * 1000  # 目标服务器时间
+        send_advance = (
+            network_latency +  # 网络延迟补偿
+            abs(time_offset) + # 时间偏移补偿
+            5  # 安全余量(5ms)
+        )
+        
+        send_time = target_time - send_advance
+        
+        logger.info(f"""
+=== 订单发送时间计划 ===
+目标服务器时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S.%f')}
+计划发送时间: {datetime.fromtimestamp(send_time/1000).strftime('%Y-%m-%d %H:%M:%S.%f')}
+提前量分析:
+- 网络延迟补偿: {network_latency:.2f}ms
+- 时间偏移补偿: {abs(time_offset):.2f}ms
+- 安全余量: 5ms
+总提前量: {send_advance:.2f}ms
+""")
+        
+        return send_time
+
     def prepare_and_snipe(self):
         """准备并执行抢购"""
         try:
-            if not self.opening_time:
-                logger.error("未设置开盘时间")
-                return None
-
-            # 计算距离开盘的时间
             current_time = datetime.now(self.timezone)
             time_to_open = (self.opening_time - current_time).total_seconds()
-
-            logger.info(f"""
-=== 抢购准备开始 ===
-目标开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
-当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}
-距离开盘: {time_to_open:.1f}秒
-""")
-
-            # 如果距离开盘超过5分钟，等待到提前5分钟
+            
+            # T-5分钟：系统初始化
             if time_to_open > 300:
-                wait_time = time_to_open - 300
-                logger.info(f"等待 {wait_time:.1f} 秒后开始系统预热...")
-                time.sleep(wait_time)
-
-            # 系统预热
-            logger.info("开始系统预热...")
-            self.warmup()
-
-            # 开始定期同步时间
-            last_sync = 0
-            while True:
-                current_time = datetime.now(self.timezone)
-                time_to_open = (self.opening_time - current_time).total_seconds()
-
-                # 如果距离开盘小于10秒，进入最终准备阶段
-                if time_to_open <= 10:
-                    logger.info("""
-=== 进入最终准备阶段 ===
-- 执行最后一次时间同步
-- 准备订单参数
-- 等待精确时间发送
-""")
-                    # 最后一次时间同步
-                    self.sync_time()
-                    # 开始抢购
-                    return self.snipe()
-
-                # 每30秒同步一次时间
-                if time.time() - last_sync >= 30:
-                    logger.info(f"距离开盘还有: {time_to_open:.1f} 秒")
-                    self.sync_time()
-                    last_sync = time.time()
-
-                # 在开盘前2分钟，显示更详细的信息
-                if time_to_open <= 120:
-                    logger.info(f"""
-=== 抢购准备状态 ===
-距离开盘: {time_to_open:.1f}秒
-网络延迟: {self.network_latency:.2f}ms
-时间偏移: {self.time_offset:.2f}ms
-系统状态: {'正常' if abs(self.time_offset) < 1000 else '需要同步'}
-""")
-
+                logger.info(f"等待进入5分钟准备阶段... 剩余{time_to_open-300:.1f}秒")
+                time.sleep(time_to_open - 300)
+            
+            # 开始5分钟准备
+            self.perf.start('preparation')
+            
+            # 1. 系统预热
+            if not self._warm_up_system():
+                return None
+                
+            # 2. 网络优化
+            if not self.optimize_network_connection():
+                logger.warning("网络优化失败，继续执行")
+                
+            # 3. 服务器选择
+            server_results = self.test_server_latency()
+            if not server_results:
+                logger.warning("服务器选择失败，使用默认服务器")
+                
+            # T-2分钟：准备阶段
+            while (time_to_open := self._get_time_to_open()) > 120:
                 time.sleep(1)
-
-        except KeyboardInterrupt:
-            logger.info("程序被用户中断")
-            return None
+                
+            logger.info("进入2分钟准备阶段...")
+            
+            # 4. 预创建会话和参数
+            if not self._prepare_sessions():
+                return None
+                
+            # 5. 准备订单参数
+            order_params = self._prepare_order_params()
+            if not order_params:
+                return None
+                
+            # T-30秒：最终准备
+            while (time_to_open := self._get_time_to_open()) > 30:
+                time.sleep(1)
+                
+            logger.info("进入30秒最终准备阶段...")
+            
+            # 6. 最后时间同步和参数准备
+            sync_results = self._final_time_sync()
+            if not sync_results:
+                return None
+                
+            send_time = self._calculate_send_time(sync_results)
+            if not send_time:
+                return None
+                
+            # T-1秒：就绪状态
+            while (time_to_open := self._get_time_to_open()) > 1:
+                time.sleep(0.1)
+                
+            logger.info("进入发送准备状态...")
+            
+            # 7. 高精度等待
+            current_time = time.perf_counter() * 1000
+            while current_time < send_time:
+                if send_time - current_time > 1:
+                    time.sleep(0.0001)  # 100微秒的自旋等待
+                current_time = time.perf_counter() * 1000
+                
+            # 8. 执行下单
+            self.perf.start('order_execution')
+            
+            # 并发发送订单
+            orders = []
+            threads = []
+            order_ids = set()
+            
+            execution_start = time.perf_counter()
+            
+            for _ in range(self.concurrent_orders):
+                thread = threading.Thread(
+                    target=lambda: self._place_order_and_collect(orders, order_ids, order_params)
+                )
+                threads.append(thread)
+                thread.start()
+                
+            # 等待所有订单完成
+            for thread in threads:
+                thread.join(timeout=1.0)
+                
+            # 处理订单结果
+            success_order = self._handle_orders(order_ids)
+            
+            execution_time = self.perf.stop('order_execution')
+            total_time = time.perf_counter() - execution_start
+            
+            logger.info(f"""
+=== 抢购执行完成 ===
+总耗时: {total_time*1000:.2f}ms
+订单执行: {execution_time:.2f}ms
+发送订单数: {len(order_ids)}
+成功订单数: {1 if success_order else 0}
+订单延迟: {(time.perf_counter() - execution_start) * 1000:.2f}ms
+""")
+            
+            return success_order
+            
         except Exception as e:
-            logger.error(f"准备过程发生错误: {str(e)}")
+            logger.exception("抢购过程发生错误")
             return None
 
     def setup_snipe_strategy(self):
@@ -1801,6 +2042,139 @@ class BinanceSniper:
             
         # 实际下单逻辑
         return super().place_market_order()
+
+    def _prepare_market_data_stream(self):
+        """准备市场数据流"""
+        try:
+            # 1. 准备WebSocket连接
+            self.ws = websocket.WebSocketApp(
+                f"wss://stream.binance.com:9443/ws/{self.symbol.lower().replace('/', '')}@depth5@100ms",
+                on_message=self._on_depth_message,
+                on_error=self._on_ws_error,
+                on_close=self._on_ws_close
+            )
+            
+            # 2. 启动WebSocket线程
+            self.ws_thread = threading.Thread(target=self.ws.run_forever)
+            self.ws_thread.daemon = True
+            self.ws_thread.start()
+            
+            logger.info("市场数据流准备就绪")
+            return True
+            
+        except Exception as e:
+            logger.error(f"准备市场数据流失败: {str(e)}")
+            return False
+
+    def _calculate_fetch_time(self, sync_results: Tuple[float, float]) -> float:
+        """计算市场数据获取时间
+        Args:
+            sync_results: (网络延迟, 时间偏移)
+        Returns:
+            float: 数据获取时间戳(ms)
+        """
+        network_latency, time_offset = sync_results
+        
+        # 开盘时间
+        target_time = self.opening_time.timestamp() * 1000
+        
+        # 计算提前量
+        # 1. 网络延迟补偿
+        # 2. API处理时间(预估20ms)
+        # 3. 数据处理时间(预估5ms)
+        fetch_advance = (
+            network_latency +  # 网络延迟
+            20 +              # API处理时间
+            5                 # 数据处理时间
+        )
+        
+        # 数据获取时间 = 开盘时间 - 提前量
+        fetch_time = target_time - fetch_advance
+        
+        logger.info(f"""
+=== 市场数据获取计划 ===
+目标开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S.%f')}
+计划获取时间: {datetime.fromtimestamp(fetch_time/1000).strftime('%Y-%m-%d %H:%M:%S.%f')}
+提前量分析:
+- 网络延迟补偿: {network_latency:.2f}ms
+- API处理时间: 20ms
+- 数据处理时间: 5ms
+总提前量: {fetch_advance:.2f}ms
+""")
+        
+        return fetch_time
+
+    def _fetch_market_data(self) -> Dict:
+        """获取市场数据"""
+        try:
+            # 1. 获取深度数据
+            depth = self.query_client.fetch_order_book(self.symbol, limit=5)
+            
+            # 2. 提取关键数据
+            first_ask = depth['asks'][0] if depth['asks'] else None
+            first_bid = depth['bids'][0] if depth['bids'] else None
+            
+            if not first_ask or not first_bid:
+                raise ValueError("无法获取市场深度数据")
+                
+            market_data = {
+                'first_ask': first_ask[0],  # 卖一价
+                'first_bid': first_bid[0],  # 买一价
+                'spread': first_ask[0] - first_bid[0],  # 价差
+                'timestamp': depth['timestamp']
+            }
+            
+            logger.debug(f"市场数据: {market_data}")
+            return market_data
+            
+        except Exception as e:
+            logger.error(f"获取市场数据失败: {str(e)}")
+            return None
+
+    def prepare_and_snipe(self):
+        """准备并执行抢购"""
+        try:
+            # ... 前面的代码保持不变 ...
+            
+            # T-1秒：最终准备
+            while (time_to_open := self._get_time_to_open()) > 1:
+                time.sleep(0.1)
+                
+            logger.info("进入最终准备阶段...")
+            
+            # 计算市场数据获取时间
+            fetch_time = self._calculate_fetch_time(sync_results)
+            
+            # 等待获取市场数据的时间点
+            current_time = time.perf_counter() * 1000
+            while current_time < fetch_time:
+                if fetch_time - current_time > 1:
+                    time.sleep(0.0001)
+                current_time = time.perf_counter() * 1000
+                
+            # 获取市场数据
+            market_data = self._fetch_market_data()
+            if not market_data:
+                logger.error("无法获取市场数据，终止抢购")
+                return None
+                
+            # 根据市场数据调整订单参数
+            first_ask = market_data['first_ask']
+            if first_ask > self.max_price:
+                logger.warning(f"卖一价({first_ask})超过最高接受价格({self.max_price})")
+                return None
+                
+            # 更新订单参数
+            order_params['price'] = first_ask
+            
+            # 继续等待发送订单的时间点
+            while current_time < send_time:
+                if send_time - current_time > 1:
+                    time.sleep(0.0001)
+                current_time = time.perf_counter() * 1000
+                
+            # 执行下单
+            # ... 后面的代码保持不变 ...
 
 def print_menu():
     """打印主菜单"""
