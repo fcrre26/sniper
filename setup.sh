@@ -1,97 +1,296 @@
 #!/bin/bash
 
+# 定义退出码
+SUCCESS=0           # 成功退出
+ERR_DOWNLOAD=1      # 下载失败
+ERR_INSTALL=2      # 安装失败
+ERR_DEPENDENCY=3    # 依赖检查失败
+ERR_RUNTIME=4      # 运行时错误
+
 echo "====== 币安现货抢币工具安装脚本 ======"
 
-# 下载主程序
-echo "正在下载主程序..."
-curl -o binance_sniper.py https://raw.githubusercontent.com/fcrre26/sniper/refs/heads/main/binance_sniper.py
-if [ $? -ne 0 ]; then
-    echo "下载失败，请检查网络连接"
-    exit 1
-fi
-echo "主程序下载成功"
-
-# 检查pip是否安装
-if ! command -v pip &> /dev/null; then
-    echo "正在安装pip..."
-    curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-    python get-pip.py
-    rm get-pip.py
-fi
-
-# 安装基本依赖
-echo "安装Python依赖..."
-pip install ccxt pandas numpy
-
-# 安装TA-Lib
-echo "安装TA-Lib..."
-if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-    # Linux
-    sudo apt-get update
-    sudo apt-get install -y build-essential
-    sudo apt-get install -y python3-dev
-    sudo apt-get install -y ta-lib
-    pip install TA-Lib
-elif [[ "$OSTYPE" == "darwin"* ]]; then
-    # Mac OS
-    brew install ta-lib
-    pip install TA-Lib
-else
-    echo "请手动安装TA-Lib，参考: https://github.com/mrjbq7/ta-lib"
-fi
-
-# 检查安装结果
-echo "检查依赖安装..."
-python3 -c "
+# 检查依赖函数
+check_dependencies() {
+    echo "正在检查依赖..."
+    local need_install=false
+    
+    # 检查Python依赖
+    python3 -c "
 try:
     import ccxt
+    print('CCXT: 已安装 ✓')
+except ImportError:
+    print('CCXT: 未安装 ✗')
+    exit(1)
+
+try:
     import pandas
+    print('Pandas: 已安装 ✓')
+except ImportError:
+    print('Pandas: 未安装 ✗')
+    exit(2)
+
+try:
     import numpy
+    print('Numpy: 已安装 ✓')
+except ImportError:
+    print('Numpy: 未安装 ✗')
+    exit(3)
+
+try:
     import talib
-    print('所有依赖安装成功!')
-except ImportError as e:
-    print(f'依赖安装失败: {str(e)}')
+    print('TA-Lib: 已安装 ✓')
+except ImportError:
+    print('TA-Lib: 未安装 ✗')
+    exit(4)
 "
+    local check_result=$?
+    
+    if [ $check_result -ne 0 ]; then
+        echo "发现未安装的依赖，是否现在安装? (y/n)"
+        read -p "请选择: " install_choice
+        if [[ $install_choice == "y" || $install_choice == "Y" ]]; then
+            install_dependencies
+            echo "依赖安装完成，重新检查..."
+            check_dependencies
+            return
+        fi
+    fi
+    
+    # 检查配置文件
+    if [ -f "config.ini" ]; then
+        echo "配置文件: 已存在 ✓"
+    else
+        echo "配置文件: 未创建 ✗"
+        echo "配置文件将在首次运行时自动创建"
+    fi
+    
+    # 检查主程序
+    if [ -f "binance_sniper.py" ]; then
+        echo "主程序: 已存在 ✓"
+    else
+        echo "主程序: 未下载 ✗"
+        echo "是否现在下载主程序? (y/n)"
+        read -p "请选择: " download_choice
+        if [[ $download_choice == "y" || $download_choice == "Y" ]]; then
+            download_main_program
+        fi
+    fi
+    
+    echo "依赖检查完成!"
+    read -p "按回车键继续..."
+}
 
-# 设置执行权限
-chmod +x binance_sniper.py
+# 下载主程序函数
+download_main_program() {
+    echo "正在下载主程序..."
+    curl -o binance_sniper.py https://raw.githubusercontent.com/fcrre26/sniper/refs/heads/main/binance_sniper.py
+    if [ $? -ne 0 ]; then
+        echo "下载失败，请检查网络连接"
+        return $ERR_DOWNLOAD
+    fi
+    chmod +x binance_sniper.py
+    echo "主程序下载成功"
+    return $SUCCESS
+}
 
-echo """
-====== 安装完成 ======
-使用方法:
-1. 运行程序: python3 binance_sniper.py
-2. 首次运行需要设置API密钥
-3. 设置抢购策略后即可开始使用
+# 安装依赖函数
+install_dependencies() {
+    echo "正在安装依赖..."
+    
+    # 安装基本依赖
+    pip install ccxt pandas numpy
+    if [ $? -ne 0 ]; then
+        echo "基础依赖安装失败"
+        return $ERR_INSTALL
+    fi
 
-注意事项:
-- 请确保API密钥有现货交易权限
-- 建议先小额测试
-- 使用前请仔细阅读说明
-"""
+    # 安装TA-Lib
+    echo "安装TA-Lib..."
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        # Linux
+        echo "正在下载并安装TA-Lib..."
+        wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
+        if [ $? -ne 0 ]; then
+            echo "TA-Lib下载失败"
+            return $ERR_DOWNLOAD
+        fi
+        tar -xzf ta-lib-0.4.0-src.tar.gz
+        cd ta-lib/
+        ./configure --prefix=/usr
+        make
+        sudo make install
+        if [ $? -ne 0 ]; then
+            echo "TA-Lib安装失败"
+            cd ..
+            rm -rf ta-lib ta-lib-0.4.0-src.tar.gz
+            return $ERR_INSTALL
+        fi
+        cd ..
+        rm -rf ta-lib ta-lib-0.4.0-src.tar.gz
+        pip install TA-Lib
+        if [ $? -ne 0 ]; then
+            echo "TA-Lib Python包安装失败"
+            return $ERR_INSTALL
+        fi
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        # Mac OS
+        brew install ta-lib
+        if [ $? -ne 0 ]; then
+            echo "TA-Lib安装失败"
+            return $ERR_INSTALL
+        fi
+        pip install TA-Lib
+        if [ $? -ne 0 ]; then
+            echo "TA-Lib Python包安装失败"
+            return $ERR_INSTALL
+        fi
+    else
+        echo "请手动安装TA-Lib，参考: https://github.com/mrjbq7/ta-lib"
+        return $ERR_INSTALL
+    fi
+    
+    return $SUCCESS
+}
 
-# 询问是否立即运行
-while true; do
+# 测试币安API延迟函数
+test_binance_latency() {
+    echo "开始测试币安API延迟..."
+    echo "测试地点: $(curl -s ipinfo.io | grep country | cut -d'"' -f4)"
+    echo "本地IP: $(curl -s ipinfo.io | grep ip | cut -d'"' -f4)"
+    echo "本地时间: $(date)"
+    echo ""
+    echo "测试中，请稍候..."
+    
+    # 测试主要的币安API端点
+    endpoints=(
+        "api.binance.com/api/v3/ping"           # API服务器检查
+        "api1.binance.com/api/v3/time"          # 服务器时间
+        "api2.binance.com/api/v3/ticker/price"  # 价格更新
+        "api3.binance.com/api/v3/depth"         # 深度数据
+        "data-api.binance.vision"               # 行情数据
+    )
+    
+    echo "=== REST API延迟测试 ==="
+    for endpoint in "${endpoints[@]}"; do
+        echo -n "测试 ${endpoint%%/*}: "
+        # 进行5次测试取平均值
+        total_time=0
+        success_count=0
+        min_time=999999
+        max_time=0
+        
+        for i in {1..5}; do
+            time_result=$(curl -o /dev/null -s -w "%{time_total}\n" https://$endpoint)
+            if [ $? -eq 0 ]; then
+                total_time=$(echo "$total_time + $time_result" | bc)
+                # 更新最小值和最大值
+                time_ms=$(echo "$time_result * 1000" | bc)
+                if (( $(echo "$time_ms < $min_time" | bc -l) )); then
+                    min_time=$time_ms
+                fi
+                if (( $(echo "$time_ms > $max_time" | bc -l) )); then
+                    max_time=$time_ms
+                fi
+                success_count=$((success_count + 1))
+            fi
+        done
+        
+        if [ $success_count -gt 0 ]; then
+            avg_time=$(echo "scale=2; $total_time / $success_count * 1000" | bc)
+            echo "平均: ${avg_time}ms (最小: ${min_time%.*}ms, 最大: ${max_time%.*}ms)"
+        else
+            echo "连接失败"
+        fi
+    done
+    
+    # 测试WebSocket延迟
+    echo -e "\n=== WebSocket延迟测试 ==="
+    endpoints_ws=(
+        "stream.binance.com:9443/ws"     # 现货WebSocket
+        "dstream.binance.com/ws"         # 合约WebSocket
+    )
+    
+    for endpoint in "${endpoints_ws[@]}"; do
+        echo -n "测试 ${endpoint%%/*}: "
+        ws_time=$(python3 -c "
+import websocket
+import time
+import sys
+
+try:
+    start = time.time()
+    ws = websocket.create_connection('wss://$endpoint')
+    ws.send('{\"method\": \"ping\"}')
+    ws.recv()
+    ws.close()
+    print(f'{(time.time() - start) * 1000:.2f}ms')
+except Exception as e:
+    print('连接失败')
+" 2>/dev/null)
+        echo "$ws_time"
+    done
+    
     echo """
-请选择操作:
-1. 立即运行程序
-2. 退出安装脚本
+=== 延迟评估标准 ===
+优秀: <50ms     (适合高频交易)
+良好: 50-100ms  (适合一般交易)
+一般: 100-200ms (可以使用)
+较差: >200ms    (不建议使用)
+
+注意: 实际交易时的延迟可能会因为市场情况而波动
+建议在不同时段多次测试
 """
-    read -p "请输入选项 (1-2): " choice
+    
+    read -p "按回车键继续..."
+}
+
+# 主菜单循环
+while true; do
+    clear
+    echo """
+====== 币安现货抢币工具 ======
+1. 检查依赖
+2. 立即运行程序
+3. 测试API延迟
+0. 退出安装脚本
+============================
+"""
+    read -p "请选择操作 (0-3): " choice
     case $choice in
         1)
-            echo "启动币安抢币工具..."
-            python3 binance_sniper.py
-            break
+            check_dependencies
             ;;
         2)
-            echo "安装完成，退出脚本"
+            if [ ! -f "binance_sniper.py" ]; then
+                echo "主程序不存在，正在安装依赖..."
+                install_dependencies
+                if [ $? -ne 0 ]; then
+                    echo "依赖安装失败，请重试"
+                    exit $ERR_INSTALL
+                fi
+            fi
+            echo "启动币安抢币工具..."
+            python3 binance_sniper.py
+            if [ $? -ne 0 ]; then
+                echo "程序运行失败"
+                exit $ERR_RUNTIME
+            fi
+            exit $SUCCESS
+            ;;
+        3)
+            test_binance_latency
+            ;;
+        0)
+            echo "退出安装脚本"
             echo "您可以稍后通过运行 'python3 binance_sniper.py' 启动程序"
-            break
+            exit $SUCCESS
             ;;
         *)
             echo "无效选项，请重新选择"
+            sleep 1
             ;;
     esac
 done
 
-exit 0 
+exit $SUCCESS 
