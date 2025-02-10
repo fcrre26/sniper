@@ -96,59 +96,66 @@ except ImportError:
 
 try:
     import websocket
-    print('WebSocket: 已安装 ✓')
+    print('WebSocket-Client: 已安装 ✓')
 except ImportError:
-    print('WebSocket: 未安装 ✗')
+    print('WebSocket-Client: 未安装 ✗')
     exit(2)
+
+try:
+    import websockets
+    print('WebSockets: 已安装 ✓')
+except ImportError:
+    print('WebSockets: 未安装 ✗')
+    exit(3)
 
 try:
     import requests
     print('Requests: 已安装 ✓')
 except ImportError:
     print('Requests: 未安装 ✗')
-    exit(3)
+    exit(4)
 
 try:
     import pytz
     print('PyTZ: 已安装 ✓')
 except ImportError:
     print('PyTZ: 未安装 ✗')
-    exit(4)
+    exit(5)
 
 try:
     import aiohttp
     print('AIOHTTP: 已安装 ✓')
 except ImportError:
     print('AIOHTTP: 未安装 ✗')
-    exit(5)
+    exit(6)
 
 try:
     import prometheus_client
     print('Prometheus-Client: 已安装 ✓')
 except ImportError:
     print('Prometheus-Client: 未安装 ✗')
-    exit(6)
+    exit(7)
 
 try:
     import psutil
     print('PSUtil: 已安装 ✓')
 except ImportError:
     print('PSUtil: 未安装 ✗')
-    exit(7)
+    exit(8)
 
 try:
     import numba
     print('Numba: 已安装 ✓')
 except ImportError:
     print('Numba: 未安装 ✗')
-    exit(8)
+    exit(9)
 
 try:
     import numpy
     print('NumPy: 已安装 ✓')
 except ImportError:
     print('NumPy: 未安装 ✗')
-    exit(9)
+    exit(10)
 "
     local check_result=$?
     
@@ -227,6 +234,7 @@ install_dependencies() {
     pip install -U pip setuptools wheel
     pip install ccxt                # 加密货币交易所API
     pip install websocket-client    # WebSocket客户端
+    pip install websockets         # WebSocket异步客户端
     pip install requests           # HTTP请求库
     pip install pytz              # 时区处理
     pip install aiohttp           # 异步HTTP客户端
