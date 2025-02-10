@@ -1037,13 +1037,27 @@ class BinanceSniper:
                 logger.error(f"查询API测试失败: {str(e)}")
                 return False
 
-            # 4. 检查交易对是否存在
+            # 4. 检查交易对（区分已有交易对和新币）
             try:
-                ticker = self.query_client.fetch_ticker(self.symbol)
-                logger.info(f"交易对 {self.symbol} 当前价格: {ticker['last']}")
+                if hasattr(self, 'symbol') and self.symbol:
+                    try:
+                        symbol_str = str(self.symbol)
+                        if '/' in symbol_str:  # 标准格式如 "BTC/USDT"
+                            base_coin = symbol_str.split('/')[0]
+                            if base_coin in ['BTC', 'ETH', 'BNB']:  # 已有主流币种
+                                ticker = self.query_client.fetch_ticker(symbol_str)
+                                logger.info(f"交易对 {symbol_str} 当前价格: {ticker['last']}")
+                            else:
+                                logger.info(f"交易对 {symbol_str} 可能是新币，跳过价格检查")
+                        else:
+                            logger.warning(f"交易对格式不标准: {symbol_str}")
+                    except Exception as e:
+                        logger.info(f"交易对 {symbol_str} 暂未上线（这是正常的）: {str(e)}")
+                else:
+                    logger.warning("交易对未设置，跳过交易对检查")
             except Exception as e:
-                logger.error(f"交易对 {self.symbol} 不可用: {str(e)}")
-                return False
+                logger.warning(f"交易对检查失败: {str(e)}")
+                # 继续执行，不返回False
 
             # 5. 检查账户权限
             try:
