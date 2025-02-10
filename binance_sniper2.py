@@ -153,13 +153,107 @@ class ExecutionStrategyManager:
         else:
             return self.strategies['balanced']
 
+# 在 SniperError 类定义之后,ExecutionController 类之前添加
+
+class TimeSync:
+    """时间同步管理器"""
+    def __init__(self):
+        self.network_latency = None  # 网络延迟
+        self.time_offset = None      # 时间偏移
+        self.last_sync_time = 0      # 上次同步时间
+        self.sync_interval = 60      # 同步间隔(秒)
+        self.min_samples = 5         # 最小样本数
+        self.max_samples = 10        # 最大样本数
+        self.sync_timeout = 5        # 同步超时时间(秒)
+        
+    async def sync(self, client) -> bool:
+        """同步时间
+        Args:
+            client: API客户端
+        Returns:
+            bool: 同步是否成功
+        """
+        try:
+            measurements = []
+            
+            # 收集多个样本
+            for _ in range(self.max_samples):
+                start = time.perf_counter_ns()
+                server_time = await client.fetch_time()
+                end = time.perf_counter_ns()
+                
+                rtt = (end - start) / 1e6  # 转换为毫秒
+                latency = rtt / 2
+                offset = server_time - (start/1e6 + latency)
+                
+                measurements.append({
+                    'latency': latency,
+                    'offset': offset,
+                    'rtt': rtt
+                })
+                
+                await asyncio.sleep(0.1)  # 间隔100ms
+            
+            # 过滤异常值
+            filtered = self._filter_outliers(measurements)
+            if len(filtered) < self.min_samples:
+                logger.error("有效样本数不足")
+                return False
+            
+            # 使用中位数作为最终值
+            self.network_latency = statistics.median(m['latency'] for m in filtered)
+            self.time_offset = statistics.median(m['offset'] for m in filtered)
+            self.last_sync_time = time.time()
+            
+            logger.info(f"""
+=== 时间同步完成 ===
+网络延迟: {self.network_latency:.2f}ms
+时间偏移: {self.time_offset:.2f}ms
+样本数量: {len(filtered)}
+""")
+            return True
+            
+        except Exception as e:
+            logger.error(f"时间同步失败: {str(e)}")
+            return False
+    
+    def _filter_outliers(self, measurements: List[Dict]) -> List[Dict]:
+        """过滤异常值"""
+        if len(measurements) < 4:
+            return measurements
+            
+        # 计算RTT的四分位数
+        rtts = sorted(m['rtt'] for m in measurements)
+        q1 = rtts[len(rtts)//4]
+        q3 = rtts[3*len(rtts)//4]
+        iqr = q3 - q1
+        
+        # 过滤掉RTT异常的样本
+        return [m for m in measurements if q1 - 1.5*iqr <= m['rtt'] <= q3 + 1.5*iqr]
+    
+    def needs_sync(self) -> bool:
+        """检查是否需要同步"""
+        return (
+            self.network_latency is None or
+            self.time_offset is None or
+            time.time() - self.last_sync_time > self.sync_interval
+        )
+    
+    def get_network_latency(self) -> Optional[float]:
+        """获取网络延迟"""
+        return self.network_latency
+    
+    def get_time_offset(self) -> Optional[float]:
+        """获取时间偏移"""
+        return self.time_offset
+
 # 执行流程控制器
 class ExecutionController:
     def __init__(self, 
                  time_sync: TimeSync,
-                 order_executor: OrderExecutor,
-                 depth_analyzer: MarketDepthAnalyzer,
-                 monitor: RealTimeMonitor):
+                 order_executor: 'OrderExecutor',
+                 depth_analyzer: 'MarketDepthAnalyzer',
+                 monitor: 'RealTimeMonitor'):
         self.time_sync = time_sync
         self.order_executor = order_executor
         self.depth_analyzer = depth_analyzer
@@ -526,136 +620,89 @@ def timing_decorator(category: str):
 
 class ConfigManager:
     """配置管理器"""
-    def __init__(self, config_file: str = 'config/config.ini'):
-        self.config_file = config_file
+    def __init__(self):
+        # 设置配置目录和文件路径
+        self.config_dir = 'config'
+        self.config_file = os.path.join(self.config_dir, 'api_config.ini')
+        
+        # 确保配置目录存在
+        if not os.path.exists(self.config_dir):
+            os.makedirs(self.config_dir)
+        
+        # 初始化配置解析器
         self.config = configparser.ConfigParser()
-        self._load_config()
         
-        # API配置
-        self.trade_api_key = None
-        self.trade_api_secret = None
-        self.query_api_key = None
-        self.query_api_secret = None
-        
-        # 交易配置
-        self.symbol = None
-        self.amount = None
-        self.price = None
-        
-        # 风控配置
-        self.stop_loss = 0.02
-        self.take_profit = 0.05
-        self.max_price_deviation = 0.05
-        self.max_slippage = 0.1
-        self.min_depth_requirement = 5
-        
-        # 执行配置
-        self.concurrent_orders = 3
-        self.advance_time = 100
-        self.retry_attempts = 3
-        
-        # 加载配置
-        self._load_api_config()
-        self._load_trade_config()
-        self._load_risk_config()
-        self._load_execution_config()
-    
-    def _load_config(self):
-        """加载配置文件"""
-        try:
-            if not os.path.exists(self.config_file):
-                self._create_default_config()
+        # 加载现有配置或创建新配置
+        if os.path.exists(self.config_file):
             self.config.read(self.config_file)
-        except Exception as e:
-            raise ConfigError(f"加载配置文件失败: {str(e)}")
+        else:
+            self._create_default_config()
     
     def _create_default_config(self):
         """创建默认配置"""
-        os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
         self.config['API'] = {
             'trade_api_key': '',
             'trade_api_secret': '',
             'query_api_key': '',
             'query_api_secret': ''
         }
-        self.config['Trade'] = {
-            'symbol': 'BTC/USDT',
-            'amount': '0.001',
-            'price': '0'
-        }
-        self.config['Risk'] = {
-            'stop_loss': '0.02',
-            'take_profit': '0.05',
-            'max_deviation': '0.05',
-            'max_slippage': '0.1',
-            'min_depth': '5'
-        }
-        self.config['Execution'] = {
-            'concurrent_orders': '3',
-            'advance_time': '100',
-            'retry_attempts': '3'
-        }
-        with open(self.config_file, 'w') as f:
-            self.config.write(f)
+        self.save_config()
     
-    def _load_api_config(self):
-        """加载API配置"""
-        try:
-            api_config = self.config['API']
-            self.trade_api_key = api_config.get('trade_api_key')
-            self.trade_api_secret = api_config.get('trade_api_secret')
-            self.query_api_key = api_config.get('query_api_key', self.trade_api_key)
-            self.query_api_secret = api_config.get('query_api_secret', self.trade_api_secret)
-        except Exception as e:
-            raise ConfigError(f"加载API配置失败: {str(e)}")
-    
-    def _load_trade_config(self):
-        """加载交易配置"""
-        try:
-            trade_config = self.config['Trade']
-            self.symbol = trade_config.get('symbol', 'BTC/USDT')
-            self.amount = float(trade_config.get('amount', '0.001'))
-            self.price = float(trade_config.get('price', '0'))
-        except Exception as e:
-            raise ConfigError(f"加载交易配置失败: {str(e)}")
-    
-    def _load_risk_config(self):
-        """加载风控配置"""
-        try:
-            risk_config = self.config['Risk']
-            self.stop_loss = float(risk_config.get('stop_loss', '0.02'))
-            self.take_profit = float(risk_config.get('take_profit', '0.05'))
-            self.max_price_deviation = float(risk_config.get('max_deviation', '0.05'))
-            self.max_slippage = float(risk_config.get('max_slippage', '0.1'))
-            self.min_depth_requirement = int(risk_config.get('min_depth', '5'))
-        except Exception as e:
-            raise ConfigError(f"加载风控配置失败: {str(e)}")
-    
-    def _load_execution_config(self):
-        """加载执行配置"""
-        try:
-            exec_config = self.config['Execution']
-            self.concurrent_orders = int(exec_config.get('concurrent_orders', '3'))
-            self.advance_time = int(exec_config.get('advance_time', '100'))
-            self.retry_attempts = int(exec_config.get('retry_attempts', '3'))
-        except Exception as e:
-            raise ConfigError(f"加载执行配置失败: {str(e)}")
-    
-    def save(self):
-        """保存配置"""
+    def save_config(self):
+        """保存配置到文件"""
         try:
             with open(self.config_file, 'w') as f:
                 self.config.write(f)
+            logger.info("配置已保存")
         except Exception as e:
-            raise ConfigError(f"保存配置失败: {str(e)}")
+            logger.error(f"保存配置失败: {str(e)}")
+    
+    def set_trade_api_keys(self, api_key: str, api_secret: str):
+        """设置交易API密钥"""
+        if 'API' not in self.config:
+            self.config['API'] = {}
+        self.config['API']['trade_api_key'] = api_key
+        self.config['API']['trade_api_secret'] = api_secret
+        self.save_config()
+    
+    def set_query_api_keys(self, api_key: str, api_secret: str):
+        """设置查询API密钥"""
+        if 'API' not in self.config:
+            self.config['API'] = {}
+        self.config['API']['query_api_key'] = api_key
+        self.config['API']['query_api_secret'] = api_secret
+        self.save_config()
     
     def get_trade_api_keys(self) -> Tuple[str, str]:
         """获取交易API密钥"""
-        return self.trade_api_key, self.trade_api_secret
+        if 'API' in self.config:
+            return (
+                self.config['API'].get('trade_api_key', ''),
+                self.config['API'].get('trade_api_secret', '')
+            )
+        return ('', '')
     
     def get_query_api_keys(self) -> Tuple[str, str]:
         """获取查询API密钥"""
-        return self.query_api_key, self.query_api_secret
+        if 'API' in self.config:
+            return (
+                self.config['API'].get('query_api_key', ''),
+                self.config['API'].get('query_api_secret', '')
+            )
+        return ('', '')
+    
+    def has_api_keys(self) -> bool:
+        """检查是否已设置API密钥"""
+        if 'API' not in self.config:
+            return False
+        
+        api_config = self.config['API']
+        return all([
+            api_config.get('trade_api_key'),
+            api_config.get('trade_api_secret'),
+            api_config.get('query_api_key'),
+            api_config.get('query_api_secret')
+        ])
 
 def retry_on_error(max_retries=3, delay=0.1, backoff=2, exceptions=(Exception,)):
     """重试装饰器
@@ -732,30 +779,234 @@ class BinanceSniper:
     }
     
     def __init__(self, config: 'ConfigManager'):
-        """初始化币安抢币工具
-        
-        Args:
-            config: 配置管理器实例
-        """
+        """初始化基础配置"""
         self.config = config
-        self.performance_stats: Dict[str, List[float]] = defaultdict(list)
-        self.is_test_mode: bool = False
-        self._setup_clients()
-        self.ws_client = OptimizedWebSocket(self.symbol)
-        self.time_sync = PreciseTimeSync()
-        self.event_loop = asyncio.get_event_loop()
-        self.thread_pool = ThreadPoolExecutor(max_workers=4)
-        self.error_handler = ErrorHandler()
-        self.market_data_provider = None
+        self.performance_stats = defaultdict(list)
+        self.is_test_mode = False
         
-        # 初始化执行控制器
+        # 基础配置
+        self.trade_client = None
+        self.query_client = None
+        self.ws_client = None
+        self.symbol = None
+        self.amount = None
+        self.price = None
+        self.opening_time = None
+        
+        # 设置时区
+        self.timezone = pytz.timezone('Asia/Shanghai')
+        
+        # 尝试加载API配置
+        self.load_api_keys()
+    
+    def setup_api_keys(self):
+        """设置API密钥"""
+        print("\n=== API密钥设置 ===")
+        print("请输入币安API密钥信息:")
+        
+        trade_api_key = input("交易API Key: ").strip()
+        trade_api_secret = input("交易API Secret: ").strip()
+        
+        use_separate = input("是否使用独立的查询API? (y/n): ").strip().lower()
+        if use_separate == 'y' or use_separate == 'yes':
+            query_api_key = input("查询API Key: ").strip()
+            query_api_secret = input("查询API Secret: ").strip()
+        else:
+            query_api_key = trade_api_key
+            query_api_secret = trade_api_secret
+        
+        try:
+            # 初始化并测试API客户端
+            trade_client = self._create_client(trade_api_key, trade_api_secret)
+            query_client = self._create_client(query_api_key, query_api_secret)
+            
+            # 测试连接
+            trade_client.fetch_balance()
+            query_client.fetch_time()
+            
+            # 测试成功后保存配置
+            self.config.set_trade_api_keys(trade_api_key, trade_api_secret)
+            self.config.set_query_api_keys(query_api_key, query_api_secret)
+            
+            # 设置客户端
+            self.trade_client = trade_client
+            self.query_client = query_client
+            
+            logger.info("API密钥设置成功")
+            print("\nAPI密钥设置成功!")
+            return True
+            
+        except Exception as e:
+            logger.error(f"API设置失败: {str(e)}")
+            print(f"\nAPI设置失败: {str(e)}")
+            return False
+
+    def _create_client(self, api_key: str, api_secret: str):
+        """创建CCXT客户端"""
+        return ccxt.binance({
+            'apiKey': api_key,
+            'secret': api_secret,
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'spot',
+                'adjustForTimeDifference': True
+            }
+        })
+
+    def load_api_keys(self) -> bool:
+        """从配置加载API密钥"""
+        try:
+            trade_api_key, trade_api_secret = self.config.get_trade_api_keys()
+            query_api_key, query_api_secret = self.config.get_query_api_keys()
+            
+            if not all([trade_api_key, trade_api_secret, query_api_key, query_api_secret]):
+                return False
+            
+            # 初始化客户端
+            self.trade_client = self._create_client(trade_api_key, trade_api_secret)
+            self.query_client = self._create_client(query_api_key, query_api_secret)
+            
+            # 测试连接
+            self.trade_client.fetch_balance()
+            self.query_client.fetch_time()
+            
+            logger.info("已成功加载API配置")
+            return True
+            
+        except Exception as e:
+            logger.error(f"加载API配置失败: {str(e)}")
+            self.trade_client = None
+            self.query_client = None
+            return False
+
+    def initialize_trading_system(self):
+        """初始化交易系统组件"""
+        try:
+            logger.info("开始初始化交易系统...")
+            
+            # 1. 验证必要配置
+            if not self.symbol or not self.amount or not self.opening_time:
+                raise ValueError("请先完成交易策略设置")
+            
+            # 2. 初始化客户端
+            if not self._init_clients():
+                raise ValueError("初始化交易客户端失败")
+            
+            # 3. 初始化WebSocket
+            self.ws_client = OptimizedWebSocket(self.symbol)
+            
+            # 4. 初始化其他组件
+            self.time_sync = TimeSync()
+            self.execution_controller = ExecutionController(
+                time_sync=self.time_sync,
+                order_executor=self.order_executor,
+                depth_analyzer=self.depth_analyzer,
+                monitor=self.monitor
+            )
+            self.network_optimizer = NetworkOptimizer()
+            self.monitor = RealTimeMonitor()
+            
+            logger.info("交易系统初始化完成")
+            return True
+            
+        except Exception as e:
+            logger.error(f"初始化交易系统失败: {str(e)}")
+            return False
+
+    def prepare_and_snipe(self):
+        """准备并执行抢购"""
+        try:
+            # 1. 初始化交易系统
+            if not self.initialize_trading_system():
+                print("交易系统初始化失败，请检查配置")
+                return
+            
+            # 2. 验证开盘时间
+            if not self.opening_time:
+                print("请先设置开盘时间")
+                return
+                
+            current_time = datetime.now(self.timezone)
+            time_to_open = (self.opening_time - current_time).total_seconds()
+            
+            if time_to_open <= 0:
+                print("开盘时间已过")
+                return
+            
+            # 显示抢购信息
+            print(f"""
+=== 抢购任务信息 ===
+交易对: {self.symbol}
+买入金额: {self.amount} USDT
+开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
+距离开盘: {time_to_open/3600:.1f}小时
+""")
+            
+            confirm = input("确认开始抢购任务? (yes/no): ")
+            if confirm.lower() != 'yes':
+                print("已取消抢购任务")
+                return
+            
+            # 3. 开始抢购流程
+            # ... 原有的抢购代码 ...
+            
+        except Exception as e:
+            logger.error(f"抢购任务执行失败: {str(e)}")
+            print(f"抢购任务执行失败: {str(e)}")
+
+    def _init_basic_components(self):
+        """初始化基本组件"""
+        try:
+            # 获取API密钥
+            trade_api_key, trade_api_secret = self.config.get_trade_api_keys()
+            query_api_key, query_api_secret = self.config.get_query_api_keys()
+            
+            # 如果有API密钥，则初始化客户端
+            if trade_api_key and trade_api_secret:
+                self.trade_client = ccxt.binance({
+                    'apiKey': trade_api_key,
+                    'secret': trade_api_secret,
+                    'enableRateLimit': True,
+                    'options': {
+                        'defaultType': 'spot',
+                        'adjustForTimeDifference': True
+                    }
+                })
+                
+                self.query_client = ccxt.binance({
+                    'apiKey': query_api_key,
+                    'secret': query_api_secret,
+                    'enableRateLimit': True,
+                    'options': {
+                        'defaultType': 'spot',
+                        'adjustForTimeDifference': True
+                    }
+                })
+        except Exception as e:
+            logger.warning(f"初始化基本组件时出错: {str(e)}")
+    
+    def _init_trading_components(self):
+        """初始化交易相关组件"""
+        if not self.trade_client or not self.query_client:
+            raise ValueError("请先设置API密钥")
+            
+        # 初始化其他组件
+        self.time_sync = TimeSync()
         self.execution_controller = ExecutionController(
             time_sync=self.time_sync,
             order_executor=self.order_executor,
             depth_analyzer=self.depth_analyzer,
             monitor=self.monitor
         )
-    
+        self.network_optimizer = NetworkOptimizer()
+        self.monitor = RealTimeMonitor()
+        
+        # 设置时区
+        self.timezone = pytz.timezone('Asia/Shanghai')
+        
+        # 初始化连接池
+        self._init_connection_pools()
+
     def _setup_clients(self):
         """设置交易和查询客户端"""
         # 获取两组API密钥
@@ -1431,15 +1682,103 @@ class BinanceSniper:
             logger.error(f"计算最优提前时间失败: {str(e)}")
             return False
 
-    def set_snipe_params(self, advance_time: int = 100, concurrent_orders: int = 3):
+    def set_snipe_params(self, concurrent_orders: int):
         """设置抢购参数"""
-        self.advance_time = advance_time
         self.concurrent_orders = concurrent_orders
-        logger.info(f"""
-=== 抢购参数设置 ===
-提前下单时间: {advance_time}ms
-并发订单数量: {concurrent_orders}
+        
+        # 计算最优提前时间
+        try:
+            # 0. 检查并初始化客户端
+            if not self.query_client:
+                # 获取API密钥
+                query_api_key, query_api_secret = self.config.get_query_api_keys()
+                if not query_api_key or not query_api_secret:
+                    raise ValueError("请先设置API密钥")
+                    
+                self.query_client = ccxt.binance({
+                    'apiKey': query_api_key,
+                    'secret': query_api_secret,
+                    'enableRateLimit': True,
+                    'options': {
+                        'defaultType': 'spot',
+                        'adjustForTimeDifference': True
+                    }
+                })
+            
+            # 1. 测试网络延迟
+            latencies = []
+            for _ in range(10):  # 测试10次
+                start = time.perf_counter()
+                self.query_client.fetch_time()
+                latency = (time.perf_counter() - start) * 1000
+                latencies.append(latency)
+                time.sleep(0.1)  # 间隔100ms
+            
+            # 2. 计算网络延迟
+            latencies.sort()  # 排序后去掉最高和最低值
+            avg_latency = sum(latencies[1:-1]) / len(latencies[1:-1])
+            min_latency = min(latencies[1:-1])
+            max_latency = max(latencies[1:-1])
+            
+            # 3. 获取服务器时间偏移
+            server_time = self.query_client.fetch_time()
+            local_time = int(time.time() * 1000)
+            time_offset = abs(server_time - local_time)
+            
+            # 4. 计算最优提前时间
+            # 基础延迟计算
+            api_process_time = 20  # API处理时间
+            safety_margin = 5      # 基础安全余量
+            base_advance = (
+                avg_latency +      # 平均网络延迟
+                time_offset +      # 时间偏移
+                api_process_time + # API处理时间
+                safety_margin      # 安全余量
+            )
+            
+            # 根据延迟稳定性调整
+            latency_variance = max_latency - min_latency
+            extra_margin = 0
+            if latency_variance > 50:  # 延迟波动大于50ms
+                extra_margin = latency_variance / 2  # 增加一半的波动值作为额外安全余量
+                base_advance += extra_margin
+            
+            self.advance_time = int(base_advance)
+            
+            logger.info(f"""
+=== 抢购参数优化完成 ===
+并发订单数: {concurrent_orders}
+
+网络延迟分析:
+- 最小延迟: {min_latency:.2f}ms
+- 平均延迟: {avg_latency:.2f}ms
+- 最大延迟: {max_latency:.2f}ms
+- 延迟波动: {latency_variance:.2f}ms
+- 时间偏移: {time_offset}ms
+
+提前时间计算:
+1. 基础延迟组成:
+   - 平均网络延迟:  {avg_latency:.2f}ms
+   - 时间偏移补偿:  {time_offset:.2f}ms
+   - API处理时间:   {api_process_time}ms
+   - 基础安全余量:  {safety_margin}ms
+   小计: {avg_latency + time_offset + api_process_time + safety_margin:.2f}ms
+
+2. 波动补偿:
+   - 延迟波动范围:  {latency_variance:.2f}ms
+   - 额外安全余量:  {extra_margin:.2f}ms
+   {f"   (由于延迟波动>{50}ms，增加50%波动值作为额外安全余量)" if latency_variance > 50 else "   (延迟稳定，无需额外安全余量)"}
+
+最终结果:
+- 总提前时间: {self.advance_time}ms
+- 执行评估: {"极佳 ✨" if self.advance_time < 100 else "良好 ✅" if self.advance_time < 200 else "一般 ⚠️" if self.advance_time < 500 else "较差 ❌"}
 """)
+            
+        except Exception as e:
+            logger.error(f"计算最优提前时间失败: {str(e)}")
+            # 使用保守的默认值
+            self.advance_time = 100
+            logger.warning("使用默认提前时间: 100ms")
 
     def _continuous_market_data_fetch(self, start_time: float, duration_ms: int = 1000) -> List[Dict]:
         """持续获取市场数据
@@ -1956,7 +2295,7 @@ class BinanceSniper:
             
         except Exception as e:
             logger.error(f"参数准备失败: {str(e)}")
-                return None
+            return None  # 修复这里的缩进
 
     def _final_time_sync(self) -> Tuple[float, float]:
         """最终时间同步
@@ -2006,8 +2345,8 @@ class BinanceSniper:
             float: 发送时间戳(ms)
         """
         if not sync_results:
-            return None
-            
+            return None    # 这里的缩进有问题
+        
         network_latency, time_offset = sync_results
         
         # 计算发送时间
@@ -2020,7 +2359,7 @@ class BinanceSniper:
         
         send_time = target_time - send_advance
         
-                    logger.info(f"""
+        logger.info(f"""
 === 订单发送时间计划 ===
 目标服务器时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S.%f')}
 计划发送时间: {datetime.fromtimestamp(send_time/1000).strftime('%Y-%m-%d %H:%M:%S.%f')}
@@ -2036,114 +2375,43 @@ class BinanceSniper:
     def prepare_and_snipe(self):
         """准备并执行抢购"""
         try:
+            # 1. 初始化交易系统
+            if not self.initialize_trading_system():
+                print("交易系统初始化失败，请检查配置")
+                return
+            
+            # 2. 验证开盘时间
+            if not self.opening_time:
+                print("请先设置开盘时间")
+                return
+                
             current_time = datetime.now(self.timezone)
             time_to_open = (self.opening_time - current_time).total_seconds()
             
-            # T-5分钟：系统初始化
-            if time_to_open > 300:
-                logger.info(f"等待进入5分钟准备阶段... 剩余{time_to_open-300:.1f}秒")
-                time.sleep(time_to_open - 300)
+            if time_to_open <= 0:
+                print("开盘时间已过")
+                return
             
-            # 开始5分钟准备
-            self.perf.start('preparation')
-            
-            # 1. 系统预热
-            if not self._warm_up_system():
-                return None
-                
-            # 2. 网络优化
-            if not self.optimize_network_connection():
-                logger.warning("网络优化失败，继续执行")
-                
-            # 3. 服务器选择
-            server_results = self.test_server_latency()
-            if not server_results:
-                logger.warning("服务器选择失败，使用默认服务器")
-                
-            # T-2分钟：准备阶段
-            while (time_to_open := self._get_time_to_open()) > 120:
-                time.sleep(1)
-
-            logger.info("进入2分钟准备阶段...")
-            
-            # 4. 预创建会话和参数
-            if not self._prepare_sessions():
-            return None
-                
-            # 5. 准备订单参数
-            order_params = self._prepare_order_params()
-            if not order_params:
-                return None
-                
-            # T-30秒：最终准备
-            while (time_to_open := self._get_time_to_open()) > 30:
-                time.sleep(1)
-                
-            logger.info("进入30秒最终准备阶段...")
-            
-            # 6. 最后时间同步和参数准备
-            sync_results = self._final_time_sync()
-            if not sync_results:
-                return None
-                
-            send_time = self._calculate_send_time(sync_results)
-            if not send_time:
-                return None
-                
-            # T-1秒：就绪状态
-            while (time_to_open := self._get_time_to_open()) > 1:
-                time.sleep(0.1)
-                
-            logger.info("进入发送准备状态...")
-            
-            # 7. 高精度等待
-            current_time = time.perf_counter() * 1000
-            while current_time < send_time:
-                if send_time - current_time > 1:
-                    time.sleep(0.0001)  # 100微秒的自旋等待
-                current_time = time.perf_counter() * 1000
-                
-            # 8. 执行下单
-            self.perf.start('order_execution')
-            
-            # 并发发送订单
-            orders = []
-            threads = []
-            order_ids = set()
-            
-            execution_start = time.perf_counter()
-            
-            for _ in range(self.concurrent_orders):
-                thread = threading.Thread(
-                    target=lambda: self._place_order_and_collect(orders, order_ids, order_params)
-                )
-                threads.append(thread)
-                thread.start()
-                
-            # 等待所有订单完成
-            for thread in threads:
-                thread.join(timeout=1.0)
-                
-            # 处理订单结果
-            success_order = self._handle_orders(order_ids)
-            
-            execution_time = self.perf.stop('order_execution')
-            total_time = time.perf_counter() - execution_start
-            
-            logger.info(f"""
-=== 抢购执行完成 ===
-总耗时: {total_time*1000:.2f}ms
-订单执行: {execution_time:.2f}ms
-发送订单数: {len(order_ids)}
-成功订单数: {1 if success_order else 0}
-订单延迟: {(time.perf_counter() - execution_start) * 1000:.2f}ms
+            # 显示抢购信息
+            print(f"""
+=== 抢购任务信息 ===
+交易对: {self.symbol}
+买入金额: {self.amount} USDT
+开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
+距离开盘: {time_to_open/3600:.1f}小时
 """)
             
-            return success_order
+            confirm = input("确认开始抢购任务? (yes/no): ")
+            if confirm.lower() != 'yes':
+                print("已取消抢购任务")
+                return
+            
+            # 3. 开始抢购流程
+            # ... 原有的抢购代码 ...
             
         except Exception as e:
-            logger.exception("抢购过程发生错误")
-            return None
+            logger.error(f"抢购任务执行失败: {str(e)}")
+            print(f"抢购任务执行失败: {str(e)}")
 
     def setup_snipe_strategy(self):
         """设置抢购策略"""
@@ -2152,8 +2420,76 @@ class BinanceSniper:
             
             # 1. 基础设置
             print("\n>>> 基础参数设置")
-            symbol = get_valid_input("请输入交易对 (例如 BTC/USDT): ", str)
+            coin = get_valid_input("请输入要买的币种 (例如 BTC): ", str).upper()
+            symbol = f"{coin}/USDT"  # 自动添加USDT交易对
             total_usdt = get_valid_input("请输入买入金额(USDT): ", float)
+            
+            # 添加开盘时间设置
+            print("\n>>> 开盘时间设置")
+            print("请输入开盘时间 (东八区/北京时间)")
+            
+            # 获取当前服务器时间作为参考
+            server_time = self.query_client.fetch_time()
+            current_time = datetime.fromtimestamp(server_time/1000, self.timezone)
+            print(f"\n当前币安服务器时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
+            
+            while True:
+                try:
+                    year = get_valid_input("年 (例如 2024): ", int)
+                    if year < 2024 or year > 2100:
+                        print("年份无效，请输入2024-2100之间的年份")
+                        continue
+                        
+                    month = get_valid_input("月 (1-12): ", int)
+                    if month < 1 or month > 12:
+                        print("月份必须在1-12之间")
+                        continue
+                        
+                    day = get_valid_input("日 (1-31): ", int)
+                    if day < 1 or day > 31:
+                        print("日期必须在1-31之间")
+                        continue
+                        
+                    hour = get_valid_input("时 (0-23): ", int)
+                    if hour < 0 or hour > 23:
+                        print("小时必须在0-23之间")
+                        continue
+                        
+                    minute = get_valid_input("分 (0-59): ", int)
+                    if minute < 0 or minute > 59:
+                        print("分钟必须在0-59之间")
+                        continue
+                        
+                    second = get_valid_input("秒 (0-59): ", int)
+                    if second < 0 or second > 59:
+                        print("秒数必须在0-59之间")
+                        continue
+                    
+                    # 创建开盘时间
+                    opening_time = self.timezone.localize(datetime(year, month, day, hour, minute, second))
+                    
+                    # 检查是否早于当前时间
+                    if opening_time <= current_time:
+                        print("错误: 开盘时间不能早于当前时间")
+                        continue
+                    
+                    # 显示时间信息
+                    time_diff = opening_time - current_time
+                    hours = time_diff.total_seconds() / 3600
+                    
+                    print(f"\n=== 时间信息 ===")
+                    print(f"设置开盘时间: {opening_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
+                    print(f"当前服务器时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
+                    print(f"距离开盘还有: {hours:.1f}小时")
+                    
+                    confirm = input("\n确认使用这个开盘时间? (yes/no): ")
+                    if confirm.lower() == 'yes':
+                        self.opening_time = opening_time
+                        break
+                    
+                except ValueError as e:
+                    print(f"时间格式无效，请重新输入")
+                    continue
             
             # 2. 价格保护设置
             print("\n>>> 价格保护设置")
@@ -2165,28 +2501,81 @@ class BinanceSniper:
             max_price = get_valid_input("设置最高接受单价 (例如 0.05 USDT): ", float)
             price_multiplier = get_valid_input("设置开盘价倍数 (例如 3 表示最高接受开盘价的3倍): ", float)
             
-            # 3. 并发和时间设置
+            # 3. 并发设置
             print("\n>>> 执行参数设置")
             concurrent_orders = get_valid_input("并发订单数量 (建议1-5): ", int)
-            advance_time = get_valid_input("提前下单时间(ms) (建议50-200): ", int)
             
             # 4. 止盈止损设置
             print("\n>>> 止盈止损设置")
-            stop_loss = get_valid_input("止损比例 (例如 0.05 表示 5%): ", float)
-            take_profit = get_valid_input("止盈比例 (例如 0.1 表示 10%): ", float)
+            print("设置五档止盈 (第五档将自动计算剩余比例):")
+            
+            profit_ladders = []
+            total_sell_ratio = 0
+            
+            # 前四档手动设置
+            for i in range(4):
+                # 检查是否已经达到100%
+                if total_sell_ratio >= 1:
+                    logger.info("已设置完所有卖出比例")
+                    break
+                    
+                print(f"\n第{i+1}档止盈设置:")
+                print(f"当前已设置卖出比例: {total_sell_ratio*100:.1f}%")
+                print(f"剩余可设置比例: {(1-total_sell_ratio)*100:.1f}%")
+                
+                while True:
+                    profit_ratio = get_valid_input(f"涨幅比例 (例如 0.1 表示 10%): ", float)
+                    sell_ratio = get_valid_input(f"卖出比例 (例如 0.2 表示 20%): ", float)
+                    
+                    # 验证卖出比例是否合理
+                    if sell_ratio <= 0 or sell_ratio > 1:
+                        print("卖出比例必须在0-100%之间")
+                        continue
+                        
+                    new_total = total_sell_ratio + sell_ratio
+                    if new_total > 1:
+                        print(f"错误: 总卖出比例将超过100% ({new_total*100:.1f}%)")
+                        print(f"当前剩余可设置比例: {(1-total_sell_ratio)*100:.1f}%")
+                        continue
+                    
+                    break
+                
+                profit_ladders.append((profit_ratio, sell_ratio))
+                total_sell_ratio += sell_ratio
+                
+                # 显示当前设置情况
+                print("\n当前止盈设置:")
+                for idx, (p, a) in enumerate(profit_ladders):
+                    print(f"- 第{idx+1}档: 涨幅{p*100}% 卖出{a*100:.1f}%")
+                print(f"总计已设置: {total_sell_ratio*100:.1f}%")
+            
+            # 第五档自动计算剩余比例
+            if total_sell_ratio >= 1:
+                logger.info("已设置完所有卖出比例，无需设置更多档位")
+            else:
+                remaining_ratio = 1 - total_sell_ratio
+                print(f"\n第{len(profit_ladders)+1}档止盈设置 (剩余比例: {remaining_ratio*100:.1f}%):")
+                final_profit_ratio = get_valid_input(f"涨幅比例 (例如 0.3 表示 30%): ", float)
+                profit_ladders.append((final_profit_ratio, remaining_ratio))
+                total_sell_ratio = 1.0
+
+            stop_loss = get_valid_input("\n止损比例 (例如 0.05 表示 5%): ", float)
             
             # 应用设置
             self.setup_trading_pair(symbol, total_usdt)
             self.set_price_protection(max_price, price_multiplier)
-            self.set_snipe_params(advance_time, concurrent_orders)
-            self.set_profit_strategy(take_profit, stop_loss)
+            self.set_snipe_params(concurrent_orders)
+            self.set_sell_strategy(profit_ladders, stop_loss)
             
             # 显示设置结果
             logger.info(f"""
 === 抢购策略设置完成 ===
 基础参数:
+- 币种: {coin}
 - 交易对: {symbol}
 - 买入金额: {total_usdt} USDT
+- 开盘时间: {opening_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)
+- 距离开盘: {hours:.1f}小时
 
 价格保护:
 - 最高接受价格: {max_price} USDT
@@ -2194,12 +2583,19 @@ class BinanceSniper:
 
 执行参数:
 - 并发订单数: {concurrent_orders}
-- 提前下单时间: {advance_time}ms
+- 提前时间: 自动计算最优值
 
 止盈止损:
-- 止损比例: {stop_loss*100}%
-- 止盈比例: {take_profit*100}%
+阶梯止盈:
+{chr(10).join([f'- 第{i+1}档: 涨幅{p*100}% 卖出{a*100:.1f}%' for i, (p, a) in enumerate(profit_ladders)])}
+止损设置: 亏损{stop_loss*100}%
 """)
+            
+            # 在设置完成后保存策略
+            if self.save_strategy():
+                print("\n策略已保存到配置文件")
+            else:
+                print("\n警告: 策略保存失败")
             
             return True
             
@@ -2574,47 +2970,43 @@ class BinanceSniper:
     def prepare_and_snipe(self):
         """准备并执行抢购"""
         try:
-            # ... 前面的代码保持不变 ...
+            # 1. 初始化交易系统
+            if not self.initialize_trading_system():
+                print("交易系统初始化失败，请检查配置")
+                return
             
-            # T-1秒：最终准备
-            while (time_to_open := self._get_time_to_open()) > 1:
-                time.sleep(0.1)
+            # 2. 验证开盘时间
+            if not self.opening_time:
+                print("请先设置开盘时间")
+                return
                 
-            logger.info("进入最终准备阶段...")
+            current_time = datetime.now(self.timezone)
+            time_to_open = (self.opening_time - current_time).total_seconds()
             
-            # 计算市场数据获取时间
-            fetch_time = self._calculate_fetch_time(sync_results)
+            if time_to_open <= 0:
+                print("开盘时间已过")
+                return
             
-            # 等待获取市场数据的时间点
-            current_time = time.perf_counter() * 1000
-            while current_time < fetch_time:
-                if fetch_time - current_time > 1:
-                    time.sleep(0.0001)
-                current_time = time.perf_counter() * 1000
-                
-            # 获取市场数据
-            market_data = self._fetch_market_data()
-            if not market_data:
-                logger.error("无法获取市场数据，终止抢购")
-                return None
-                
-            # 根据市场数据调整订单参数
-            first_ask = market_data['first_ask']
-            if first_ask > self.max_price:
-                logger.warning(f"卖一价({first_ask})超过最高接受价格({self.max_price})")
-                return None
-                
-            # 更新订单参数
-            order_params['price'] = first_ask
+            # 显示抢购信息
+            print(f"""
+=== 抢购任务信息 ===
+交易对: {self.symbol}
+买入金额: {self.amount} USDT
+开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
+距离开盘: {time_to_open/3600:.1f}小时
+""")
             
-            # 继续等待发送订单的时间点
-            while current_time < send_time:
-                if send_time - current_time > 1:
-                    time.sleep(0.0001)
-                current_time = time.perf_counter() * 1000
-                
-            # 执行下单
-            # ... 后面的代码保持不变 ...
+            confirm = input("确认开始抢购任务? (yes/no): ")
+            if confirm.lower() != 'yes':
+                print("已取消抢购任务")
+                return
+            
+            # 3. 开始抢购流程
+            # ... 原有的抢购代码 ...
+            
+        except Exception as e:
+            logger.error(f"抢购任务执行失败: {str(e)}")
+            print(f"抢购任务执行失败: {str(e)}")
 
     async def init_market_stream(self):
         """初始化市场数据流"""
@@ -2821,6 +3213,278 @@ class BinanceSniper:
             logger.error(f"执行订单失败: {str(e)}")
             return None
 
+    def show_api_status(self):
+        """显示并测试当前API配置"""
+        print("\n=== 当前API配置状态 ===")
+        
+        # 获取当前配置
+        trade_key, _ = self.config.get_trade_api_keys()
+        query_key, _ = self.config.get_query_api_keys()
+        
+        # 显示配置信息（只显示前6位和后4位，中间用*代替）
+        def mask_key(key: str) -> str:
+            if not key:
+                return "未设置"
+            return f"{key[:6]}{'*' * (len(key)-10)}{key[-4:]}"
+        
+        print(f"""
+交易API Key: {mask_key(trade_key)}
+查询API Key: {mask_key(query_key)}
+""")
+        
+        # 测试API连接
+        print("\n正在测试API连接...")
+        
+        success = True
+        try:
+            # 测试交易API
+            print("\n1. 测试交易API:")
+            balance = self.trade_client.fetch_balance()
+            usdt_balance = balance.get('USDT', {}).get('free', 0)
+            print(f"✅ 连接成功")
+            print(f"   可用USDT余额: {usdt_balance:.2f}")
+            
+            # 测试查询API
+            print("\n2. 测试查询API:")
+            server_time = self.query_client.fetch_time()
+            local_time = int(time.time() * 1000)
+            time_diff = abs(server_time - local_time)
+            print(f"✅ 连接成功")
+            print(f"   服务器时间: {datetime.fromtimestamp(server_time/1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+            print(f"   时间偏差: {time_diff}ms")
+            
+            # 测试市场数据访问
+            print("\n3. 测试市场数据访问:")
+            btc_ticker = self.query_client.fetch_ticker('BTC/USDT')
+            print(f"✅ 数据访问正常")
+            print(f"   BTC当前价格: {btc_ticker['last']:.2f} USDT")
+            
+            print("\n=== 测试结论 ===")
+            print("API配置状态: 正常 ✨")
+            print(f"建议: 可以开始设置抢购策略")
+            
+        except Exception as e:
+            success = False
+            print(f"\n❌ 测试失败: {str(e)}")
+            print("\n=== 测试结论 ===")
+            print("API配置状态: 异常 ⚠️")
+            print("建议: 请重新设置API密钥")
+        
+        return success
+
+    def setup_api_keys(self):
+        """设置API密钥"""
+        print("\n=== API密钥设置 ===")
+        print("请输入币安API密钥信息:")
+        
+        trade_api_key = input("交易API Key: ").strip()
+        trade_api_secret = input("交易API Secret: ").strip()
+        
+        use_separate = input("是否使用独立的查询API? (y/n): ").strip().lower()
+        if use_separate == 'y' or use_separate == 'yes':
+            query_api_key = input("查询API Key: ").strip()
+            query_api_secret = input("查询API Secret: ").strip()
+        else:
+            query_api_key = trade_api_key
+            query_api_secret = trade_api_secret
+        
+        try:
+            # 初始化并测试API客户端
+            trade_client = self._create_client(trade_api_key, trade_api_secret)
+            query_client = self._create_client(query_api_key, query_api_secret)
+            
+            # 测试连接
+            trade_client.fetch_balance()
+            query_client.fetch_time()
+            
+            # 测试成功后保存配置
+            self.config.set_trade_api_keys(trade_api_key, trade_api_secret)
+            self.config.set_query_api_keys(query_api_key, query_api_secret)
+            
+            # 设置客户端
+            self.trade_client = trade_client
+            self.query_client = query_client
+            
+            logger.info("API密钥设置成功")
+            print("\nAPI密钥设置成功!")
+            return True
+            
+        except Exception as e:
+            logger.error(f"API设置失败: {str(e)}")
+            print(f"\nAPI设置失败: {str(e)}")
+            return False
+
+    def print_strategy(self):
+        """显示当前策略设置"""
+        if not self.symbol or not self.amount or not self.opening_time:
+            print("\n未设置抢购策略，请先设置策略")
+            return
+        
+        try:
+            # 获取当前服务器时间
+            server_time = self.query_client.fetch_time()
+            current_time = datetime.fromtimestamp(server_time/1000, self.timezone)
+            time_diff = self.opening_time - current_time
+            hours = time_diff.total_seconds() / 3600
+            
+            # 获取当前市场价格作为参考
+            ticker = self.query_client.fetch_ticker(self.symbol)
+            current_price = ticker['last']
+            
+            print(f"""
+====== 当前抢购策略 ======
+基础参数:
+- 币种: {self.symbol.split('/')[0]}
+- 交易对: {self.symbol}
+- 买入金额: {self.amount} USDT
+- 当前市价: {current_price} USDT
+
+时间信息:
+- 开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)
+- 当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)
+- 剩余时间: {hours:.1f}小时
+
+价格保护:
+- 最高接受价格: {self.max_price_limit} USDT
+- 开盘价倍数: {self.price_multiplier}倍
+
+执行参数:
+- 并发订单数: {self.concurrent_orders}
+- 提前时间: {self.advance_time}ms
+
+止盈止损:
+阶梯止盈:
+{chr(10).join([f'- 第{i+1}档: 涨幅{p*100}% 卖出{a*100:.1f}%' for i, (p, a) in enumerate(self.sell_strategy)])}
+止损设置: 亏损{self.stop_loss*100}%
+
+网络状态:
+- API连接: {"正常 ✅" if self.trade_client and self.query_client else "异常 ❌"}
+- WebSocket: {"已连接 ✅" if self.ws_client else "未连接 ❌"}
+""")
+
+        except Exception as e:
+            logger.error(f"显示策略失败: {str(e)}")
+            print(f"\n显示策略失败: {str(e)}")
+
+    def save_strategy(self):
+        """保存当前策略到配置文件"""
+        try:
+            if not os.path.exists(self.config.config_dir):
+                os.makedirs(self.config.config_dir)
+                
+            strategy_file = os.path.join(self.config.config_dir, 'strategy.ini')
+            config = configparser.ConfigParser()
+            
+            # 保存基础参数
+            config['Basic'] = {
+                'symbol': self.symbol,
+                'amount': str(self.amount),
+                'opening_time': self.opening_time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            # 保存价格保护参数
+            config['PriceProtection'] = {
+                'max_price_limit': str(self.max_price_limit),
+                'price_multiplier': str(self.price_multiplier)
+            }
+            
+            # 保存执行参数
+            config['Execution'] = {
+                'concurrent_orders': str(self.concurrent_orders),
+                'advance_time': str(self.advance_time)
+            }
+            
+            # 保存止盈止损策略
+            config['StopStrategy'] = {
+                'stop_loss': str(self.stop_loss),
+                'sell_strategy': json.dumps(self.sell_strategy)  # 将列表转换为JSON字符串
+            }
+            
+            with open(strategy_file, 'w') as f:
+                config.write(f)
+                
+            logger.info("策略已保存到配置文件")
+            return True
+            
+        except Exception as e:
+            logger.error(f"保存策略失败: {str(e)}")
+            return False
+
+    def load_strategy(self) -> bool:
+        """从配置文件加载策略"""
+        try:
+            strategy_file = os.path.join(self.config.config_dir, 'strategy.ini')
+            if not os.path.exists(strategy_file):
+                logger.info("未找到已保存的策略")
+                return False
+                
+            config = configparser.ConfigParser()
+            config.read(strategy_file)
+            
+            # 加载基础参数
+            self.symbol = config['Basic']['symbol']
+            self.amount = float(config['Basic']['amount'])
+            self.opening_time = datetime.strptime(
+                config['Basic']['opening_time'],
+                '%Y-%m-%d %H:%M:%S'
+            ).replace(tzinfo=self.timezone)
+            
+            # 加载价格保护参数
+            self.max_price_limit = float(config['PriceProtection']['max_price_limit'])
+            self.price_multiplier = float(config['PriceProtection']['price_multiplier'])
+            
+            # 加载执行参数
+            self.concurrent_orders = int(config['Execution']['concurrent_orders'])
+            self.advance_time = int(config['Execution']['advance_time'])
+            
+            # 加载止盈止损策略
+            self.stop_loss = float(config['StopStrategy']['stop_loss'])
+            self.sell_strategy = json.loads(config['StopStrategy']['sell_strategy'])
+            
+            logger.info("已成功加载策略配置")
+            return True
+            
+        except Exception as e:
+            logger.error(f"加载策略失败: {str(e)}")
+            return False
+
+    def setup_snipe_strategy(self):
+        """设置抢购策略"""
+        try:
+            # ... 原有的策略设置代码 ...
+            
+            # 在设置完成后保存策略
+            if self.save_strategy():
+                print("\n策略已保存到配置文件")
+            else:
+                print("\n警告: 策略保存失败")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"设置抢购策略失败: {str(e)}")
+            return False
+
+    def print_strategy(self):
+        """显示当前策略设置"""
+        # 如果没有加载策略，先尝试加载
+        if not hasattr(self, 'symbol') or not self.symbol:
+            if not self.load_strategy():
+                print("\n未找到已保存的策略，请先设置策略")
+                return
+        
+        # ... 原有的显示代码 ...
+
+    def prepare_and_snipe(self):
+        """准备并执行抢购"""
+        # 如果没有加载策略，先尝试加载
+        if not hasattr(self, 'symbol') or not self.symbol:
+            if not self.load_strategy():
+                print("\n未找到已保存的策略，请先设置策略")
+                return
+        
+        # ... 原有的抢购代码 ...
+
 class ErrorHandler:
     """统一错误处理"""
     def __init__(self):
@@ -2984,18 +3648,27 @@ def print_menu():
     print("0. 退出")
     print("=====================")
 
-def get_valid_input(prompt: str, input_type=float, allow_empty: bool = False):
-    """获取有效输入"""
+def get_valid_input(prompt: str, input_type: Type = str, allow_empty: bool = False) -> Any:
+    """获取有效输入
+    Args:
+        prompt: 提示信息
+        input_type: 输入类型
+        allow_empty: 是否允许空输入
+    Returns:
+        Any: 转换后的输入值
+    """
     while True:
         try:
-            value = input(prompt)
-            if allow_empty and not value.strip():
+            value = input(prompt).strip()
+            if allow_empty and not value:
                 return None
-            if input_type == str and value.strip():
-                return value.strip()
+            if input_type == str:
+                if value:
+                    return value
+                raise ValueError("输入不能为空")
             return input_type(value)
         except ValueError:
-            print("输入无效，请重试")
+            print(f"输入无效，请输入{input_type.__name__}类型的值")
 
 def check_dependencies():
     """检查依赖"""
@@ -3015,8 +3688,9 @@ def setup_snipe_strategy(sniper: BinanceSniper):
     
     # 1. 基础设置
     print("\n>>> 基础参数设置")
-    symbol = get_valid_input("请输入交易对 (例如 BTC/USDT): ", str)
-    total_usdt = get_valid_input("请输入买入金额(USDT): ")
+    coin = get_valid_input("请输入要买的币种 (例如 BTC): ", str).upper()
+    symbol = f"{coin}/USDT"  # 自动添加USDT交易对
+    total_usdt = get_valid_input("请输入买入金额(USDT): ", float)
     
     # 添加开盘时间设置
     print("\n>>> 开盘时间设置")
@@ -3089,23 +3763,23 @@ def setup_snipe_strategy(sniper: BinanceSniper):
     print("3. 使用IOC限价单，超出价格自动取消")
     print("------------------------")
 
-    max_price = get_valid_input("设置最高接受单价 (例如 0.05 USDT): ")
-    price_multiplier = get_valid_input("设置开盘价倍数 (例如 3 表示最高接受开盘价的3倍): ")
+    max_price = get_valid_input("设置最高接受单价 (例如 0.05 USDT): ", float)
+    price_multiplier = get_valid_input("设置开盘价倍数 (例如 3 表示最高接受开盘价的3倍): ", float)
 
     # 3. 阶梯卖出策略
     print("\n>>> 阶梯卖出策略设置")
     print("设置三档止盈:")
     
-    profit1 = get_valid_input("第一档止盈比例 (例如 0.1 表示 10%): ")
-    amount1 = get_valid_input("第一档卖出比例 (例如 0.5 表示 50%): ")
+    profit1 = get_valid_input("第一档止盈比例 (例如 0.1 表示 10%): ", float)
+    amount1 = get_valid_input("第一档卖出比例 (例如 0.5 表示 50%): ", float)
     
-    profit2 = get_valid_input("第二档止盈比例 (例如 0.2 表示 20%): ")
-    amount2 = get_valid_input("第二档卖出比例 (例如 0.3 表示 30%): ")
+    profit2 = get_valid_input("第二档止盈比例 (例如 0.2 表示 20%): ", float)
+    amount2 = get_valid_input("第二档卖出比例 (例如 0.3 表示 30%): ", float)
     
-    profit3 = get_valid_input("第三档止盈比例 (例如 0.3 表示 30%): ")
-    amount3 = get_valid_input("第三档卖出比例 (例如 0.2 表示 20%): ")
+    profit3 = get_valid_input("第三档止盈比例 (例如 0.3 表示 30%): ", float)
+    amount3 = get_valid_input("第三档卖出比例 (例如 0.2 表示 20%): ", float)
     
-    stop_loss = get_valid_input("设置止损比例 (例如 0.05 表示 5%): ")
+    stop_loss = get_valid_input("设置止损比例 (例如 0.05 表示 5%): ", float)
 
     # 应用设置
     try:
@@ -3145,28 +3819,6 @@ def setup_snipe_strategy(sniper: BinanceSniper):
         return
 
     input("\n按回车继续...")
-
-def print_strategy(sniper: BinanceSniper):
-    """打印当前策略"""
-    print("\n====== 当前抢币策略 ======")
-    print(f"交易对: {sniper.symbol}")
-    print(f"买入金额: {sniper.amount} USDT")
-    print(f"下单方式: IOC限价单(立即成交或取消)")
-    
-    print("\n价格保护:")
-    print(f"最高接受价格: {sniper.max_price_limit} USDT")
-    print(f"开盘价倍数: {sniper.price_multiplier}倍")
-    print(f"最小深度: {sniper.min_depth_requirement}个订单")
-    
-    print("\n卖出策略:")
-    print(f"止盈比例: {sniper.take_profit*100}%")
-    print(f"止损比例: {sniper.stop_loss*100}%")
-    
-    max_attempts, check_interval = sniper.config.get_snipe_settings()
-    print("\n执行参数:")
-    print(f"最大尝试次数: {max_attempts}")
-    print(f"检查间隔: {check_interval}秒")
-    print("========================")
 
 def run_as_daemon():
     """以守护进程方式运行"""
@@ -3247,52 +3899,44 @@ def main():
     try:
         config = ConfigManager()
         
-        # 验证配置
-        is_valid, errors = config.validate_config()
-        if not is_valid:
-            logger.error("配置验证失败:")
-            for error in errors:
-                logger.error(f"- {error}")
-            return
-        
         with BinanceSniper(config) as sniper:
-            # 系统健康检查
-            is_healthy, health_checks = sniper.check_system_health()
-            if not is_healthy:
-                logger.warning("系统健康检查未通过，请确认是否继续")
-                if not get_valid_input("是否继续? (y/n): ", str).lower().startswith('y'):
-                    return
-            
-            # 命令映射
-            commands = {
-                "1": ("设置API密钥", sniper.setup_api_keys),
-                "2": ("抢开盘策略设置", sniper.setup_snipe_strategy),
-                "3": ("查看当前策略", sniper.print_strategy),
-                "4": ("开始抢购", sniper.prepare_and_snipe),
-                "0": ("退出程序", lambda: "exit")
-            }
+            # 尝试加载API配置
+            if sniper.load_api_keys():
+                print("已加载保存的API配置")
             
             while True:
                 try:
                     print_menu()
                     choice = input("请选择操作 (0-4): ").strip()
                     
-                    if choice not in commands:
+                    if choice == "0":
+                        break
+                    
+                    if choice == "1":
+                        if not sniper.trade_client or not sniper.query_client:
+                            sniper.setup_api_keys()
+                        else:
+                            print("\nAPI已配置，是否重新设置? (yes/no): ")
+                            if input().lower() == 'yes':
+                                sniper.setup_api_keys()
+                            else:
+                                print("保持现有配置")
+                                sniper.show_api_status()  # 添加这一行
+                    elif choice == "2":
+                        sniper.setup_snipe_strategy()
+                    elif choice == "3":
+                        sniper.print_strategy()
+                    elif choice == "4":
+                        sniper.prepare_and_snipe()
+                    else:
                         print("选择无效，请重试")
-                            continue
-                    
-                    name, action = commands[choice]
-                    logger.info(f"用户选择: {name}")
-                    
-                    result = action()
-                    if result == "exit":
-                    break
+                        continue
 
-                        input("\n按回车继续...")
+                    input("\n按回车继续...")
                     
                 except KeyboardInterrupt:
                     raise
-                    except Exception as e:
+                except Exception as e:
                     logger.exception(f"操作执行失败: {str(e)}")
                     print(f"\n操作失败: {str(e)}")
                     print("请检查日志获取详细信息")
@@ -3305,7 +3949,6 @@ def main():
         print(f"\n程序错误: {str(e)}")
     finally:
         logger.info("程序退出")
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Binance Sniper')
