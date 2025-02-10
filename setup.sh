@@ -422,11 +422,12 @@ while true; do
 3. 测试API延迟
 4. 安装系统服务
 5. 立即运行程序
-6. 查看运行日志
+6. 后台运行程序
+7. 查看运行日志
 0. 退出安装脚本
 ============================
 """
-    read -p "请选择操作 (0-6): " choice
+    read -p "请选择操作 (0-7): " choice
     case $choice in
         1)
             check_dependencies
@@ -449,6 +450,22 @@ while true; do
             python3 binance_sniper.py
             ;;
         6)
+            if [ ! -f "binance_sniper.py" ]; then
+                echo "错误: 主程序不存在"
+                read -p "按回车键继续..."
+                continue
+            fi
+            echo """
+=== 后台运行说明 ===
+1. 程序会在前台启动，您可以进行设置
+2. 即使SSH意外断开，程序也会继续在后台运行
+3. 重新连接服务器后，使用 screen -r sniper 可以重新查看程序
+4. 主动退出请在程序中选择0退出
+"""
+            read -p "按回车键开始运行..."
+            screen -RR sniper python3 binance_sniper.py
+            ;;
+        7)
             if [ -f "/var/log/binance-sniper/output.log" ]; then
                 tail -f /var/log/binance-sniper/output.log
             else
