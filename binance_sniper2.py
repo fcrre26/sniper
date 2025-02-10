@@ -9,7 +9,12 @@ import sys
 from logging.handlers import RotatingFileHandler
 from collections import defaultdict
 import configparser
-from typing import Tuple, Optional, Dict, List, Any, Set
+from typing import (
+    Tuple, Optional, Dict, List, Any, Set, 
+    Callable, Union, TypeVar, Type
+)
+from types import TracebackType
+from decimal import Decimal
 import websocket
 import requests
 import pytz
@@ -21,9 +26,6 @@ import daemon
 import signal
 import lockfile
 from abc import ABC, abstractmethod
-from decimal import Decimal
-from dataclasses import dataclass, field
-from enum import Enum
 import asyncio
 import aiohttp
 import numpy as np
@@ -40,6 +42,7 @@ import socket
 import gc
 import struct
 import statistics
+import glob
 
 # 统一异常处理
 class SniperError(Exception):
@@ -52,6 +55,18 @@ class NetworkError(SniperError):
 
 class ExecutionError(SniperError):
     """执行相关异常"""
+    pass
+
+class MarketError(SniperError):
+    """市场相关异常"""
+    pass
+
+class ConfigError(SniperError):
+    """配置相关异常"""
+    pass
+
+class TimeError(SniperError):
+    """时间同步相关异常"""
     pass
 
 def setup_logger():
@@ -510,108 +525,137 @@ def timing_decorator(category: str):
     return decorator
 
 class ConfigManager:
-    """配置管理类"""
-    def __init__(self):
+    """配置管理器"""
+    def __init__(self, config_file: str = 'config/config.ini'):
+        self.config_file = config_file
         self.config = configparser.ConfigParser()
-        self.config_file = 'config.ini'
-        self.load_config()
-
-    def load_config(self):
+        self._load_config()
+        
+        # API配置
+        self.trade_api_key = None
+        self.trade_api_secret = None
+        self.query_api_key = None
+        self.query_api_secret = None
+        
+        # 交易配置
+        self.symbol = None
+        self.amount = None
+        self.price = None
+        
+        # 风控配置
+        self.stop_loss = 0.02
+        self.take_profit = 0.05
+        self.max_price_deviation = 0.05
+        self.max_slippage = 0.1
+        self.min_depth_requirement = 5
+        
+        # 执行配置
+        self.concurrent_orders = 3
+        self.advance_time = 100
+        self.retry_attempts = 3
+        
+        # 加载配置
+        self._load_api_config()
+        self._load_trade_config()
+        self._load_risk_config()
+        self._load_execution_config()
+    
+    def _load_config(self):
         """加载配置文件"""
-        if os.path.exists(self.config_file):
-            self.config.read(self.config_file, encoding='utf-8')
-        else:
-            # 创建默认配置
-            self.config['API'] = {
-                'trade_key': '',
-                'trade_secret': '',
-                'query_key': '',
-                'query_secret': ''
-            }
-            self.config['SNIPE'] = {
-                'max_attempts': '10',
-                'check_interval': '0.2'
-            }
-            self.save_config()
-            logger.info("创建默认配置文件")
-
-    def save_config(self):
-        """保存配置到文件"""
         try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
+            if not os.path.exists(self.config_file):
+                self._create_default_config()
+            self.config.read(self.config_file)
+        except Exception as e:
+            raise ConfigError(f"加载配置文件失败: {str(e)}")
+    
+    def _create_default_config(self):
+        """创建默认配置"""
+        os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+        self.config['API'] = {
+            'trade_api_key': '',
+            'trade_api_secret': '',
+            'query_api_key': '',
+            'query_api_secret': ''
+        }
+        self.config['Trade'] = {
+            'symbol': 'BTC/USDT',
+            'amount': '0.001',
+            'price': '0'
+        }
+        self.config['Risk'] = {
+            'stop_loss': '0.02',
+            'take_profit': '0.05',
+            'max_deviation': '0.05',
+            'max_slippage': '0.1',
+            'min_depth': '5'
+        }
+        self.config['Execution'] = {
+            'concurrent_orders': '3',
+            'advance_time': '100',
+            'retry_attempts': '3'
+        }
+        with open(self.config_file, 'w') as f:
+            self.config.write(f)
+    
+    def _load_api_config(self):
+        """加载API配置"""
+        try:
+            api_config = self.config['API']
+            self.trade_api_key = api_config.get('trade_api_key')
+            self.trade_api_secret = api_config.get('trade_api_secret')
+            self.query_api_key = api_config.get('query_api_key', self.trade_api_key)
+            self.query_api_secret = api_config.get('query_api_secret', self.trade_api_secret)
+        except Exception as e:
+            raise ConfigError(f"加载API配置失败: {str(e)}")
+    
+    def _load_trade_config(self):
+        """加载交易配置"""
+        try:
+            trade_config = self.config['Trade']
+            self.symbol = trade_config.get('symbol', 'BTC/USDT')
+            self.amount = float(trade_config.get('amount', '0.001'))
+            self.price = float(trade_config.get('price', '0'))
+        except Exception as e:
+            raise ConfigError(f"加载交易配置失败: {str(e)}")
+    
+    def _load_risk_config(self):
+        """加载风控配置"""
+        try:
+            risk_config = self.config['Risk']
+            self.stop_loss = float(risk_config.get('stop_loss', '0.02'))
+            self.take_profit = float(risk_config.get('take_profit', '0.05'))
+            self.max_price_deviation = float(risk_config.get('max_deviation', '0.05'))
+            self.max_slippage = float(risk_config.get('max_slippage', '0.1'))
+            self.min_depth_requirement = int(risk_config.get('min_depth', '5'))
+        except Exception as e:
+            raise ConfigError(f"加载风控配置失败: {str(e)}")
+    
+    def _load_execution_config(self):
+        """加载执行配置"""
+        try:
+            exec_config = self.config['Execution']
+            self.concurrent_orders = int(exec_config.get('concurrent_orders', '3'))
+            self.advance_time = int(exec_config.get('advance_time', '100'))
+            self.retry_attempts = int(exec_config.get('retry_attempts', '3'))
+        except Exception as e:
+            raise ConfigError(f"加载执行配置失败: {str(e)}")
+    
+    def save(self):
+        """保存配置"""
+        try:
+            with open(self.config_file, 'w') as f:
                 self.config.write(f)
-            logger.info("配置保存成功")
         except Exception as e:
-            logger.error(f"保存配置失败: {str(e)}")
-
-    def set_api_keys(self, trade_key: str, trade_secret: str, query_key: str = None, query_secret: str = None):
-        """设置API密钥"""
-        try:
-            # 验证API密钥格式
-            if not trade_key or not trade_secret:
-                raise ValueError("交易API密钥不能为空")
-
-            # 设置交易API
-            self.config['API']['trade_key'] = trade_key
-            self.config['API']['trade_secret'] = trade_secret
-
-            # 设置查询API（如果提供）
-            if query_key and query_secret:
-                self.config['API']['query_key'] = query_key
-                self.config['API']['query_secret'] = query_secret
-            else:
-                # 如果没有提供查询API，使用相同的密钥
-                self.config['API']['query_key'] = trade_key
-                self.config['API']['query_secret'] = trade_secret
-
-            self.save_config()
-            logger.info("""
-=== API密钥设置成功 ===
-交易API: 已更新
-查询API: 已更新
-""")
-            
-        except Exception as e:
-            logger.error(f"设置API密钥失败: {str(e)}")
-            raise
-
+            raise ConfigError(f"保存配置失败: {str(e)}")
+    
     def get_trade_api_keys(self) -> Tuple[str, str]:
         """获取交易API密钥"""
-        return (
-            self.config['API'].get('trade_key', ''),
-            self.config['API'].get('trade_secret', '')
-        )
-
+        return self.trade_api_key, self.trade_api_secret
+    
     def get_query_api_keys(self) -> Tuple[str, str]:
         """获取查询API密钥"""
-        return (
-            self.config['API'].get('query_key', ''),
-            self.config['API'].get('query_secret', '')
-        )
-
-    def set_snipe_settings(self, max_attempts: int = None, check_interval: float = None):
-        """设置抢购参数"""
-        try:
-            if max_attempts is not None:
-                self.config['SNIPE']['max_attempts'] = str(max_attempts)
-            if check_interval is not None:
-                self.config['SNIPE']['check_interval'] = str(check_interval)
-            self.save_config()
-            logger.info(f"""
-=== 抢购参数设置成功 ===
-最大尝试次数: {max_attempts}
-检查间隔: {check_interval}秒
-""")
-        except Exception as e:
-            logger.error(f"设置抢购参数失败: {str(e)}")
-            raise
-
-    def get_snipe_settings(self) -> Tuple[int, float]:
-        """获取抢购参数"""
-        return (
-            int(self.config['SNIPE'].get('max_attempts', 10)),
-            float(self.config['SNIPE'].get('check_interval', 0.2))
-)
+        return self.query_api_key, self.query_api_secret
 
 def retry_on_error(max_retries=3, delay=0.1, backoff=2, exceptions=(Exception,)):
     """重试装饰器
@@ -649,6 +693,13 @@ def retry_on_error(max_retries=3, delay=0.1, backoff=2, exceptions=(Exception,))
             return None
         return wrapper
     return decorator
+
+# 定义一些类型别名
+OrderType = Dict[str, Any]
+OrderID = str
+MarketData = Dict[str, Union[float, str]]
+Timestamp = float
+T = TypeVar('T')  # 用于泛型方法
 
 class BinanceSniper:
     """币安抢币工具核心类"""
@@ -855,7 +906,7 @@ class BinanceSniper:
                 }
             )
     
-    async def sync_time(self, final_sync: bool = False) -> Tuple[float, float]:
+    async def sync_time(self, final_sync: bool = False) -> Optional[Tuple[float, float]]:
         """高精度时间同步
         Args:
             final_sync: 是否为最终同步
@@ -1495,15 +1546,16 @@ class BinanceSniper:
         
         return orders, order_ids
 
-    def snipe(self):
+    async def snipe(self) -> Optional[OrderType]:
         """执行抢购"""
         try:
             # 1. 系统初始化
             if not await self.initialize():
+                logger.error("系统初始化失败")
                 return None
             
             # 2. 委托给执行控制器
-            return await self.execution_controller.execute_snipe(
+            result = await self.execution_controller.execute_snipe(
                 client=self.trade_client,
                 symbol=self.symbol,
                 amount=self.amount,
@@ -1512,11 +1564,24 @@ class BinanceSniper:
                 concurrent_orders=self.concurrent_orders
             )
             
+            if result:
+                logger.info("抢购执行成功")
+                return result
+            else:
+                logger.warning("抢购执行失败")
+                return None
+            
+        except asyncio.CancelledError:
+            logger.warning("抢购任务被取消")
+            return None
         except Exception as e:
             logger.error(f"抢购执行失败: {str(e)}")
             return None
         finally:
-            await self.cleanup()
+            try:
+                await self.cleanup()
+            except Exception as e:
+                logger.error(f"清理资源失败: {str(e)}")
 
     def _place_order_and_collect(self, orders: list, order_ids: set):
         """下单并收集订单ID"""
@@ -1711,69 +1776,90 @@ class BinanceSniper:
 距离开盘: {time_diff.total_seconds()/3600:.1f}小时
 """)
 
-    def cleanup(self):
+    async def cleanup(self) -> None:
         """清理资源"""
         try:
-            # 关闭会话
-            for session in [self.trade_session, self.query_session]:
+            logger.info("开始清理资源...")
+            
+            # 1. 关闭 WebSocket 连接
+            if self.ws_client:
+                try:
+                    await self.ws_client.close()
+                    logger.info("WebSocket连接已关闭")
+                except Exception as e:
+                    logger.error(f"关闭WebSocket失败: {str(e)}")
+            
+            # 2. 关闭API会话
+            for name, session in {
+                'trade_session': getattr(self, 'trade_session', None),
+                'query_session': getattr(self, 'query_session', None)
+            }.items():
                 if session:
-                    session.close()
+                    try:
+                        await session.close()
+                        logger.info(f"{name} 已关闭")
+                    except Exception as e:
+                        logger.error(f"关闭 {name} 失败: {str(e)}")
             
-            # 关闭WebSocket连接
-            if hasattr(self, 'ws') and self.ws:
-                self.ws.close()
-            
-            # 保存性能统计
+            # 3. 保存性能统计
             if hasattr(self, 'perf') and self.perf.stats:
-                self._save_performance_stats()
+                try:
+                    await self._save_performance_stats()
+                    logger.info("性能统计已保存")
+                except Exception as e:
+                    logger.error(f"保存性能统计失败: {str(e)}")
             
-            # 清理临时文件
-            self._cleanup_temp_files()
+            # 4. 清理临时文件
+            try:
+                await self._cleanup_temp_files()
+                logger.info("临时文件已清理")
+            except Exception as e:
+                logger.error(f"清理临时文件失败: {str(e)}")
+            
+            # 5. 关闭线程池
+            if self.thread_pool:
+                try:
+                    self.thread_pool.shutdown(wait=True)
+                    logger.info("线程池已关闭")
+                except Exception as e:
+                    logger.error(f"关闭线程池失败: {str(e)}")
+            
+            # 6. 释放内存缓冲区
+            if hasattr(self, '_order_buffer'):
+                self._order_buffer = None
             
             logger.info("资源清理完成")
             
         except Exception as e:
-            logger.error(f"清理资源失败: {str(e)}")
-    
-    def _save_performance_stats(self):
-        """保存性能统计数据"""
-        try:
-            stats = {}
-            for metric, values in self.performance_stats.items():
-                if values:  # 只处理非空列表
-                    stats[metric] = {
-                        'min': min(values),
-                        'max': max(values),
-                        'avg': sum(values) / len(values),
-                        'count': len(values)
-                    }
-            
-            if stats:  # 只在有统计数据时保存
-            with open('performance_stats.json', 'w') as f:
-                json.dump(stats, f, indent=2)
-            logger.info("性能统计数据已保存")
-            
-        except Exception as e:
-            logger.error(f"保存性能统计失败: {str(e)}")
-    
-    def _cleanup_temp_files(self):
+            logger.error(f"资源清理过程中发生错误: {str(e)}")
+            raise
+        finally:
+            # 确保所有资源都被释放
+            self._resources.clear()
+
+    async def _cleanup_temp_files(self) -> None:
         """清理临时文件"""
-        temp_files = ['*.tmp', '*.log.?', 'performance_stats_*.json']
-        for pattern in temp_files:
-            try:
-                for file in glob.glob(pattern):
-                    if os.path.isfile(file):
+        patterns = ['*.tmp', '*.log.?', 'performance_stats_*.json']
+        for pattern in patterns:
+            for file in glob.glob(pattern):
+                if os.path.isfile(file):
+                    try:
                         os.remove(file)
-            except Exception as e:
-                logger.error(f"清理临时文件失败: {str(e)}")
-    
-    def __enter__(self):
-        """上下文管理器支持"""
+                        logger.debug(f"已删除临时文件: {file}")
+                    except Exception as e:
+                        logger.warning(f"删除文件 {file} 失败: {str(e)}")
+
+    def __enter__(self: T) -> T:
+        """上下文管理器入口"""
         return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """确保资源被正确清理"""
-        self.cleanup()
+
+    def __exit__(self, exc_type: Optional[Type[BaseException]], 
+                 exc_val: Optional[BaseException], 
+                 exc_tb: Optional[TracebackType]) -> None:
+        """上下文管理器退出"""
+        # 确保异步资源被正确清理
+        if self.event_loop and not self.event_loop.is_closed():
+            self.event_loop.run_until_complete(self.cleanup())
 
     def _warm_up_system(self) -> bool:
         """系统预热
@@ -2607,7 +2693,7 @@ class BinanceSniper:
         
         return orders, order_ids
 
-    async def execute_snipe(self) -> Optional[Dict]:
+    async def execute_snipe(self) -> Optional[OrderType]:
         """执行抢购"""
         try:
             # 1. 系统初始化
@@ -2648,7 +2734,10 @@ class BinanceSniper:
             logger.error(f"抢购执行失败: {str(e)}")
             return None
         finally:
-            await self.cleanup()
+            try:
+                await self.cleanup()
+            except Exception as e:
+                logger.error(f"清理资源失败: {str(e)}")
 
     async def _precise_wait(self, target_time: float):
         """高精度等待
@@ -2667,7 +2756,7 @@ class BinanceSniper:
                 await asyncio.sleep(0)  # 让出CPU时间片
 
     # 删除其他执行订单的方法,只保留优化版本
-    async def _execute_orders_optimized(self, market_data: Dict) -> Tuple[List, Set]:
+    async def _execute_orders_optimized(self, market_data: MarketData) -> Tuple[List[OrderType], Set[OrderID]]:
         """优化的订单执行"""
         try:
             orders = []
@@ -2686,7 +2775,7 @@ class BinanceSniper:
             
             # 批量生成时间戳和签名
             timestamps = [int(time.time() * 1000) + i for i in range(self.concurrent_orders)]
-            signatures = self._batch_generate_signatures(base_params, timestamps)
+            signatures = await self._batch_generate_signatures(base_params, timestamps)
             
             # 创建并发任务
             async with aiohttp.ClientSession() as session:
@@ -2708,12 +2797,15 @@ class BinanceSniper:
             
             return orders, order_ids
             
+        except asyncio.CancelledError:
+            logger.warning("订单执行被取消")
+            return [], set()
         except Exception as e:
             logger.error(f"订单执行失败: {str(e)}")
             return [], set()
 
     # 添加单个订单执行方法
-    async def _execute_single_order(self, params: Dict, buffer: memoryview, session: aiohttp.ClientSession) -> Optional[Dict]:
+    async def _execute_single_order(self, params: Dict, buffer: memoryview, session: aiohttp.ClientSession) -> Optional[OrderType]:
         """执行单个订单"""
         try:
             async with session.post(
@@ -2738,30 +2830,37 @@ class ErrorHandler:
         self._backoff_factor = 0.1
         self._lock = asyncio.Lock()
         
+        # 错误恢复策略
+        self._recovery_strategies = {
+            NetworkError: self._handle_network_error,
+            TimeError: self._handle_time_error,
+            MarketError: self._handle_market_error,
+            ExecutionError: self._handle_execution_error
+        }
+    
     async def handle_error(self, error: Exception, context: str, retry_func=None) -> bool:
-        """处理错误
-        Args:
-            error: 异常对象
-            context: 错误上下文
-            retry_func: 重试函数
-        Returns:
-            bool: 是否处理成功
-        """
+        """处理错误"""
         async with self._lock:
             try:
+                # 1. 记录错误
                 error_key = f"{context}:{type(error).__name__}"
                 self._error_counts[error_key] += 1
                 self._last_errors[error_key].append(time.time())
                 
-                # 清理旧的错误记录
+                # 2. 清理旧记录
                 self._cleanup_old_errors(error_key)
                 
-                # 检查错误频率
+                # 3. 检查是否严重错误
                 if self._is_critical_error(error_key):
                     logger.critical(f"严重错误 - {context}: {str(error)}")
                     return False
                 
-                # 执行重试
+                # 4. 执行对应的恢复策略
+                error_type = type(error)
+                if error_type in self._recovery_strategies:
+                    return await self._recovery_strategies[error_type](error, retry_func)
+                
+                # 5. 默认重试策略
                 if retry_func:
                     return await self._retry_with_backoff(retry_func)
                 
@@ -2770,6 +2869,79 @@ class ErrorHandler:
             except Exception as e:
                 logger.error(f"错误处理失败: {str(e)}")
                 return False
+    
+    async def _handle_network_error(self, error: NetworkError, retry_func) -> bool:
+        """处理网络错误"""
+        try:
+            # 1. 检查网络连接
+            if not await self._check_network():
+                return False
+            
+            # 2. 重新初始化连接
+            await self._reinit_connection()
+            
+            # 3. 执行重试
+            if retry_func:
+                return await self._retry_with_backoff(retry_func)
+            
+            return False
+        except Exception as e:
+            logger.error(f"网络错误恢复失败: {str(e)}")
+            return False
+    
+    async def _handle_time_error(self, error: TimeError, retry_func) -> bool:
+        """处理时间同步错误"""
+        try:
+            # 1. 重新同步时间
+            if not await self._resync_time():
+                return False
+            
+            # 2. 执行重试
+            if retry_func:
+                return await self._retry_with_backoff(retry_func)
+            
+            return False
+        except Exception as e:
+            logger.error(f"时间同步错误恢复失败: {str(e)}")
+            return False
+    
+    async def _handle_market_error(self, error: MarketError, retry_func) -> bool:
+        """处理市场错误"""
+        try:
+            # 1. 检查市场状态
+            if not await self._check_market_status():
+                return False
+            
+            # 2. 更新市场数据
+            await self._update_market_data()
+            
+            # 3. 执行重试
+            if retry_func:
+                return await self._retry_with_backoff(retry_func)
+            
+            return False
+        except Exception as e:
+            logger.error(f"市场错误恢复失败: {str(e)}")
+            return False
+    
+    async def _handle_execution_error(self, error: ExecutionError, retry_func) -> bool:
+        """处理执行错误"""
+        try:
+            # 1. 检查订单状态
+            if not await self._check_order_status():
+                return False
+            
+            # 2. 清理失败订单
+            await self._cleanup_failed_orders()
+            
+            # 3. 执行重试
+            if retry_func:
+                return await self._retry_with_backoff(retry_func)
+            
+            return False
+        except Exception as e:
+            logger.error(f"执行错误恢复失败: {str(e)}")
+            return False
     
     def _cleanup_old_errors(self, error_key: str):
         """清理旧的错误记录"""
