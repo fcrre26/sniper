@@ -2894,7 +2894,7 @@ class BinanceSniper:
             
             try:
                 # 异步网络测试
-                network_stats = loop.run_until_complete(self.measure_network_stats())
+                network_stats = loop.run_until_complete(self._measure_network_stats_async())
                 if not network_stats:
                     print("网络状态测试失败，请检查网络连接")
                     return
@@ -2904,7 +2904,7 @@ class BinanceSniper:
                 test_start = time.time()
                 
                 while time.time() - test_start < 300:  # 测试5分钟
-                    stats = loop.run_until_complete(self.measure_network_stats(5))
+                    stats = loop.run_until_complete(self._measure_network_stats_async(5))
                     if stats:
                         test_results.append(stats)
                         print(f"\033[2K\r当前网络状态: 延迟 {stats['latency']:.2f}ms (波动: ±{stats['jitter']/2:.2f}ms) 偏移: {stats['offset']:.2f}ms")
@@ -2930,7 +2930,7 @@ class BinanceSniper:
                 return result
                 
             finally:
-                # 关闭事件循环
+                # 清理资源
                 try:
                     # 取消所有待处理的任务
                     pending = asyncio.all_tasks(loop)
@@ -3517,7 +3517,7 @@ class BinanceSniper:
             
             try:
                 # 异步网络测试
-                network_stats = loop.run_until_complete(self.measure_network_stats())
+                network_stats = loop.run_until_complete(self._measure_network_stats_async())
                 if not network_stats:
                     print("网络状态测试失败，请检查网络连接")
                     return
@@ -3527,7 +3527,7 @@ class BinanceSniper:
                 test_start = time.time()
                 
                 while time.time() - test_start < 300:  # 测试5分钟
-                    stats = loop.run_until_complete(self.measure_network_stats(5))
+                    stats = loop.run_until_complete(self._measure_network_stats_async(5))
                     if stats:
                         test_results.append(stats)
                         print(f"\033[2K\r当前网络状态: 延迟 {stats['latency']:.2f}ms (波动: ±{stats['jitter']/2:.2f}ms) 偏移: {stats['offset']:.2f}ms")
@@ -3553,7 +3553,7 @@ class BinanceSniper:
                 return result
                 
             finally:
-                # 关闭事件循环
+                # 清理资源
                 try:
                     # 取消所有待处理的任务
                     pending = asyncio.all_tasks(loop)
@@ -4439,15 +4439,16 @@ class BinanceSniper:
             logger.error(f"初始化客户端失败: {str(e)}")
             return False
 
-    async def measure_network_stats(self, samples: int = 5) -> Optional[Dict[str, float]]:
-        """测量网络状态"""
+    async def _measure_network_stats_async(self, samples: int = 5) -> Optional[Dict[str, float]]:
+        """异步测量网络状态 - 仅用于功能4"""
         try:
             latencies = []
             offsets = []
             
             for _ in range(samples):
                 start_time = time.time() * 1000
-                server_time = await self.query_client.fetch_time()
+                # 确保使用异步方式调用API
+                server_time = await self.query_client.fetchTime()  # 注意这里是fetchTime而不是fetch_time
                 end_time = time.time() * 1000
                 
                 latency = end_time - start_time
@@ -4456,7 +4457,7 @@ class BinanceSniper:
                 latencies.append(latency)
                 offsets.append(offset)
                 
-                await asyncio.sleep(0.1)  # 100ms间隔
+                await asyncio.sleep(0.1)
                 
             avg_latency = statistics.mean(latencies)
             jitter = statistics.stdev(latencies) if len(latencies) > 1 else 0
