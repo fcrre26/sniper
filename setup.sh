@@ -6,12 +6,83 @@ ERR_DOWNLOAD=1      # 下载失败
 ERR_INSTALL=2      # 安装失败
 ERR_DEPENDENCY=3    # 依赖检查失败
 ERR_RUNTIME=4      # 运行时错误
+ERR_SYSTEM=5       # 系统要求不满足
 
 echo "====== 币安现货抢币工具安装脚本 ======"
+
+# 检查Python版本
+check_python_version() {
+    echo "检查 Python 版本..."
+    # 检查 Python 版本 >= 3.9
+    python3 -c "import sys; exit(0) if sys.version_info >= (3, 9) else exit(1)" || {
+        echo "错误: 需要 Python 3.9 或更高版本"
+        echo "当前版本: $(python3 --version)"
+        return 1
+    }
+    echo "Python 版本检查通过 ✓"
+}
+
+# 检查系统资源
+check_system_resources() {
+    echo "检查系统资源..."
+    
+    # 检查内存
+    total_mem=$(free -m | awk '/^Mem:/{print $2}')
+    if [ $total_mem -lt 2048 ]; then  # 小于2GB
+        echo "警告: 内存可能不足 (建议至少2GB)"
+        return 1
+    else
+        echo "内存检查通过 ✓ (${total_mem}MB)"
+    fi
+    
+    # 检查CPU
+    cpu_cores=$(nproc)
+    if [ $cpu_cores -lt 2 ]; then
+        echo "警告: CPU核心数可能不足 (建议至少2核)"
+        return 1
+    else
+        echo "CPU检查通过 ✓ ($cpu_cores 核)"
+    fi
+    
+    # 检查磁盘空间
+    free_space=$(df -m . | awk 'NR==2 {print $4}')
+    if [ $free_space -lt 1024 ]; then  # 小于1GB
+        echo "警告: 磁盘空间可能不足 (建议至少1GB)"
+        return 1
+    else
+        echo "磁盘空间检查通过 ✓ (${free_space}MB)"
+    fi
+    
+    return 0
+}
+
+# 检查网络连接
+check_network() {
+    echo "检查网络连接..."
+    
+    # 测试到币安API的连接
+    curl -s -m 5 https://api.binance.com/api/v3/ping > /dev/null
+    if [ $? -ne 0 ]; then
+        echo "警告: 无法连接到币安API"
+        return 1
+    fi
+    echo "网络连接检查通过 ✓"
+    return 0
+}
 
 # 检查依赖函数
 check_dependencies() {
     echo "正在检查依赖..."
+    
+    # 首先检查Python版本
+    check_python_version || return $ERR_DEPENDENCY
+    
+    # 检查系统资源
+    check_system_resources || return $ERR_SYSTEM
+    
+    # 检查网络连接
+    check_network || return $ERR_SYSTEM
+    
     local need_install=false
     
     # 检查Python依赖
@@ -52,18 +123,32 @@ except ImportError:
     exit(5)
 
 try:
-    import daemon
-    print('Python-Daemon: 已安装 ✓')
+    import prometheus_client
+    print('Prometheus-Client: 已安装 ✓')
 except ImportError:
-    print('Python-Daemon: 未安装 ✗')
+    print('Prometheus-Client: 未安装 ✗')
     exit(6)
 
 try:
-    import lockfile
-    print('Lockfile: 已安装 ✓')
+    import psutil
+    print('PSUtil: 已安装 ✓')
 except ImportError:
-    print('Lockfile: 未安装 ✗')
+    print('PSUtil: 未安装 ✗')
     exit(7)
+
+try:
+    import numba
+    print('Numba: 已安装 ✓')
+except ImportError:
+    print('Numba: 未安装 ✗')
+    exit(8)
+
+try:
+    import numpy
+    print('NumPy: 已安装 ✓')
+except ImportError:
+    print('NumPy: 未安装 ✗')
+    exit(9)
 "
     local check_result=$?
     
@@ -78,8 +163,18 @@ except ImportError:
         fi
     fi
     
+    # 检查配置目录
+    if [ ! -d "config" ]; then
+        mkdir -p config
+    fi
+    
+    # 检查日志目录
+    if [ ! -d "logs" ]; then
+        mkdir -p logs
+    fi
+    
     # 检查配置文件
-    if [ -f "config.ini" ]; then
+    if [ -f "config/config.ini" ]; then
         echo "配置文件: 已存在 ✓"
     else
         echo "配置文件: 未创建 ✗"
@@ -129,23 +224,23 @@ install_dependencies() {
 
     # 安装依赖包
     echo "正在安装依赖包..."
+    pip install -U pip setuptools wheel
     pip install ccxt                # 加密货币交易所API
     pip install websocket-client    # WebSocket客户端
     pip install requests           # HTTP请求库
     pip install pytz              # 时区处理
     pip install aiohttp           # 异步HTTP客户端
-    pip install urllib3           # HTTP客户端（requests的依赖）
-    pip install cryptography      # 加密库（可能需要）
-    pip install python-dateutil   # 日期处理
-    pip install python-daemon lockfile
-
+    pip install prometheus-client  # 监控指标
+    pip install psutil            # 系统资源监控
+    pip install numba            # 性能优化
+    pip install numpy            # 数学计算
+    pip install cachetools       # 缓存支持
+    pip install python-daemon    # 守护进程支持
+    pip install lockfile         # 文件锁
+    
     # 检查安装结果
     echo -e "\n====== 依赖安装完成 ======"
-    echo "已安装的包版本:"
-    pip freeze | grep -E "ccxt|websocket-client|requests|pytz|aiohttp|urllib3|cryptography|python-dateutil|python-daemon|lockfile"
-
-    echo -e "\n如果看到以上包的版本信息，说明安装成功"
-    echo "====== 安装完成 ======"
+    pip freeze | grep -E "ccxt|websocket-client|requests|pytz|aiohttp|prometheus-client|psutil|numba|numpy|cachetools|python-daemon|lockfile"
     
     return $SUCCESS
 }
@@ -159,6 +254,7 @@ install_service() {
 [Unit]
 Description=Binance Sniper Service
 After=network.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -171,6 +267,13 @@ RestartSec=3
 StandardOutput=append:/var/log/binance-sniper/output.log
 StandardError=append:/var/log/binance-sniper/error.log
 
+# 性能优化设置
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=99
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+LimitNOFILE=65535
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -178,6 +281,19 @@ EOF
     # 创建日志目录
     sudo mkdir -p /var/log/binance-sniper
     sudo chown $USER:$USER /var/log/binance-sniper
+
+    # 创建日志轮转配置
+    sudo cat > /etc/logrotate.d/binance-sniper << EOF
+/var/log/binance-sniper/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 $USER $USER
+}
+EOF
 
     # 重新加载systemd配置
     sudo systemctl daemon-reload
@@ -192,6 +308,7 @@ EOF
 - 停止: sudo systemctl stop binance-sniper
 - 状态: sudo systemctl status binance-sniper
 - 查看日志: tail -f /var/log/binance-sniper/output.log
+- 查看错误: tail -f /var/log/binance-sniper/error.log
 """
 }
 
@@ -292,34 +409,22 @@ while true; do
     clear
     echo """
 ====== 币安现货抢币工具 ======
-1. 检查依赖
-2. 立即运行程序
+1. 检查系统环境
+2. 安装/更新依赖
 3. 测试API延迟
 4. 安装系统服务
+5. 立即运行程序
+6. 查看运行日志
 0. 退出安装脚本
 ============================
 """
-    read -p "请选择操作 (0-4): " choice
+    read -p "请选择操作 (0-6): " choice
     case $choice in
         1)
             check_dependencies
             ;;
         2)
-            if [ ! -f "binance_sniper.py" ]; then
-                echo "主程序不存在，正在安装依赖..."
-                install_dependencies
-                if [ $? -ne 0 ]; then
-                    echo "依赖安装失败，请重试"
-                    exit $ERR_INSTALL
-                fi
-            fi
-            echo "启动币安抢币工具..."
-            python3 binance_sniper.py
-            if [ $? -ne 0 ]; then
-                echo "程序运行失败"
-                exit $ERR_RUNTIME
-            fi
-            exit $SUCCESS
+            install_dependencies
             ;;
         3)
             test_binance_latency
@@ -327,9 +432,24 @@ while true; do
         4)
             install_service
             ;;
+        5)
+            if [ ! -f "binance_sniper.py" ]; then
+                echo "错误: 主程序不存在"
+                read -p "按回车键继续..."
+                continue
+            fi
+            python3 binance_sniper.py
+            ;;
+        6)
+            if [ -f "/var/log/binance-sniper/output.log" ]; then
+                tail -f /var/log/binance-sniper/output.log
+            else
+                echo "错误: 日志文件不存在"
+                read -p "按回车键继续..."
+            fi
+            ;;
         0)
             echo "退出安装脚本"
-            echo "您可以稍后通过运行 'python3 binance_sniper.py' 启动程序"
             exit $SUCCESS
             ;;
         *)
