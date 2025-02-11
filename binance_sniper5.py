@@ -1352,6 +1352,7 @@ class BinanceSniper:
         """异步抢购实现"""
         try:
             # 异步网络测试
+            print("\n正在测试网络状态...")
             network_stats = await self.measure_network_stats()
             if not network_stats:
                 print("网络状态测试失败，请检查网络连接")
@@ -1392,6 +1393,43 @@ class BinanceSniper:
             print(f"抢购任务执行失败: {str(e)}")
             return None
 
+    async def measure_network_stats(self, samples: int = 10) -> Optional[Dict]:
+        """测量网络状态"""
+        try:
+            latencies = []
+            offsets = []
+            
+            for _ in range(samples):
+                start_time = time.time() * 1000
+                # 使用异步方式调用API
+                server_time = await asyncio.to_thread(self.query_client.fetch_time)
+                end_time = time.time() * 1000
+                
+                latency = (end_time - start_time) / 2
+                offset = server_time - (start_time + latency)
+                
+                latencies.append(latency)
+                offsets.append(offset)
+                
+                await asyncio.sleep(0.1)  # 100ms间隔
+                
+            # 过滤异常值
+            filtered_latencies = self._filter_outliers(latencies)
+            filtered_offsets = self._filter_outliers(offsets)
+            
+            if not filtered_latencies or not filtered_offsets:
+                return None
+                
+            return {
+                'latency': statistics.mean(filtered_latencies),
+                'offset': statistics.mean(filtered_offsets),
+                'jitter': statistics.stdev(filtered_latencies) if len(filtered_latencies) > 1 else 0
+            }
+            
+        except Exception as e:
+            logger.error(f"网络状态测量失败: {str(e)}")
+            return None
+
     def prepare_and_snipe(self):
         """准备并执行抢购"""
         try:
@@ -1401,6 +1439,11 @@ class BinanceSniper:
             # 加载API配置(同步方法)
             if not self.load_api_keys():
                 print("API配置加载失败，请检查配置")
+                return
+            
+            # 0. 加载策略配置
+            if not self.load_strategy():
+                print("请先设置抢购策略（选项2）")
                 return
             
             # 1. 初始化交易系统(同步方法)
@@ -1418,6 +1461,19 @@ class BinanceSniper:
             
             if time_to_open <= 0:
                 print("开盘时间已过")
+                return
+
+            print(f"""
+=== 抢购配置确认 ===
+交易对: {self.symbol}
+买入金额: {self.amount} USDT
+开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
+距离开盘: {time_to_open/3600:.1f}小时
+""")
+
+            confirm = input("确认开始抢购? (yes/no): ")
+            if confirm.lower() != 'yes':
+                print("已取消抢购")
                 return
 
             # 3. 创建事件循环用于异步操作
@@ -2882,6 +2938,11 @@ class BinanceSniper:
                 print("API配置加载失败，请检查配置")
                 return
             
+            # 0. 加载策略配置
+            if not self.load_strategy():
+                print("请先设置抢购策略（选项2）")
+                return
+            
             # 1. 初始化交易系统(同步方法)
             if not self._init_clients():
                 print("交易系统初始化失败，请检查配置")
@@ -2898,51 +2959,27 @@ class BinanceSniper:
             if time_to_open <= 0:
                 print("开盘时间已过")
                 return
-            
-            # 3. 测试网络状态
-            print("\n正在测试网络状态...")
-            
-            # 创建事件循环用于网络测试和执行
+
+            print(f"""
+=== 抢购配置确认 ===
+交易对: {self.symbol}
+买入金额: {self.amount} USDT
+开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
+距离开盘: {time_to_open/3600:.1f}小时
+""")
+
+            confirm = input("确认开始抢购? (yes/no): ")
+            if confirm.lower() != 'yes':
+                print("已取消抢购")
+                return
+
+            # 3. 创建事件循环用于异步操作
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             
             try:
-                # 异步网络测试
-                network_stats = loop.run_until_complete(self._measure_network_stats_async())
-                if not network_stats:
-                    print("网络状态测试失败，请检查网络连接")
-                    return
-
-                print("\n=== 开始网络测试（持续5分钟）===")
-                test_results = []
-                test_start = time.time()
-                
-                while time.time() - test_start < 300:  # 测试5分钟
-                    stats = loop.run_until_complete(self._measure_network_stats_async(5))
-                    if stats:
-                        test_results.append(stats)
-                        print(f"\033[2K\r当前网络状态: 延迟 {stats['latency']:.2f}ms (波动: ±{stats['jitter']/2:.2f}ms) 偏移: {stats['offset']:.2f}ms")
-                        sys.stdout.flush()
-                    time.sleep(30)  # 每30秒测试一次
-
-                # 4. 执行抢购(异步)
-                print("\n=== 准备开始执行 ===")
-                result = loop.run_until_complete(self.execute_snipe())
-                
-                # 5. 显示结果
-                if result:
-                    print(f"""
-=== 抢购成功 ===
-订单ID: {result['id']}
-成交价格: {result['average']}
-成交数量: {result['filled']}
-成交金额: {result['cost']} USDT
-""")
-                else:
-                    print("抢购未成功")
-                    
-                return result
-                
+                # 4. 执行异步抢购
+                return loop.run_until_complete(self.prepare_and_snipe_async())
             finally:
                 # 清理资源
                 try:
@@ -3505,6 +3542,11 @@ class BinanceSniper:
                 print("API配置加载失败，请检查配置")
                 return
             
+            # 0. 加载策略配置
+            if not self.load_strategy():
+                print("请先设置抢购策略（选项2）")
+                return
+            
             # 1. 初始化交易系统(同步方法)
             if not self._init_clients():
                 print("交易系统初始化失败，请检查配置")
@@ -3521,51 +3563,27 @@ class BinanceSniper:
             if time_to_open <= 0:
                 print("开盘时间已过")
                 return
-            
-            # 3. 测试网络状态
-            print("\n正在测试网络状态...")
-            
-            # 创建事件循环用于网络测试和执行
+
+            print(f"""
+=== 抢购配置确认 ===
+交易对: {self.symbol}
+买入金额: {self.amount} USDT
+开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
+距离开盘: {time_to_open/3600:.1f}小时
+""")
+
+            confirm = input("确认开始抢购? (yes/no): ")
+            if confirm.lower() != 'yes':
+                print("已取消抢购")
+                return
+
+            # 3. 创建事件循环用于异步操作
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             
             try:
-                # 异步网络测试
-                network_stats = loop.run_until_complete(self._measure_network_stats_async())
-                if not network_stats:
-                    print("网络状态测试失败，请检查网络连接")
-                    return
-
-                print("\n=== 开始网络测试（持续5分钟）===")
-                test_results = []
-                test_start = time.time()
-                
-                while time.time() - test_start < 300:  # 测试5分钟
-                    stats = loop.run_until_complete(self._measure_network_stats_async(5))
-                    if stats:
-                        test_results.append(stats)
-                        print(f"\033[2K\r当前网络状态: 延迟 {stats['latency']:.2f}ms (波动: ±{stats['jitter']/2:.2f}ms) 偏移: {stats['offset']:.2f}ms")
-                        sys.stdout.flush()
-                    time.sleep(30)  # 每30秒测试一次
-
-                # 4. 执行抢购(异步)
-                print("\n=== 准备开始执行 ===")
-                result = loop.run_until_complete(self.execute_snipe())
-                
-                # 5. 显示结果
-                if result:
-                    print(f"""
-=== 抢购成功 ===
-订单ID: {result['id']}
-成交价格: {result['average']}
-成交数量: {result['filled']}
-成交金额: {result['cost']} USDT
-""")
-                else:
-                    print("抢购未成功")
-                    
-                return result
-                
+                # 4. 执行异步抢购
+                return loop.run_until_complete(self.prepare_and_snipe_async())
             finally:
                 # 清理资源
                 try:
@@ -4153,10 +4171,17 @@ class BinanceSniper:
                 # 加载基础参数
                 self.symbol = config['Basic']['symbol']
                 self.amount = float(config['Basic']['amount'])
+                
+                # 解析时间并设置时区
+                opening_time_str = config['Basic']['opening_time']
                 self.opening_time = datetime.strptime(
-                    config['Basic']['opening_time'],
+                    opening_time_str,
                     '%Y-%m-%d %H:%M:%S'
-                ).replace(tzinfo=self.timezone)
+                )
+                # 确保设置东八区时区
+                if self.timezone is None:
+                    self.timezone = pytz.timezone('Asia/Shanghai')
+                self.opening_time = self.timezone.localize(self.opening_time)
                 
                 # 加载价格保护参数
                 self.max_price_limit = float(config['PriceProtection']['max_price_limit'])
@@ -4174,7 +4199,7 @@ class BinanceSniper:
 === 策略加载成功 ===
 交易对: {self.symbol}
 买入金额: {self.amount} USDT
-开盘时间: {self.opening_time}
+开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S %Z')}
 
 价格保护:
 - 最高价格: {self.max_price_limit} USDT
@@ -4461,7 +4486,7 @@ class BinanceSniper:
             
             for _ in range(samples):
                 start_time = time.time() * 1000
-                # 确保使用异步方式调用API
+                # 使用异步方式调用API
                 server_time = await self.query_client.fetchTime()  # 注意这里是fetchTime而不是fetch_time
                 end_time = time.time() * 1000
                 
