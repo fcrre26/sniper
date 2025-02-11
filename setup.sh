@@ -410,6 +410,56 @@ except Exception as e:
     read -p "按回车键继续..."
 }
 
+# 在脚本开头的常量定义后添加时间同步函数
+sync_system_time() {
+    echo "正在同步系统时间..."
+    
+    # 检查是否有root权限
+    if [ "$EUID" -ne 0 ]; then
+        echo "需要root权限来同步时间"
+        echo "请输入sudo密码:"
+        sudo -v || return 1
+    fi
+    
+    # 设置时区为UTC+8
+    echo "设置时区为Asia/Shanghai..."
+    sudo timedatectl set-timezone Asia/Shanghai
+    
+    # 检查并安装ntpdate
+    if ! command -v ntpdate &> /dev/null; then
+        echo "正在安装ntpdate..."
+        sudo apt-get update
+        sudo apt-get install -y ntpdate
+    fi
+    
+    # 同步时间
+    echo "正在从NTP服务器同步时间..."
+    sudo ntpdate ntp.aliyun.com || {
+        # 如果阿里云NTP失败，尝试其他服务器
+        sudo ntpdate time.windows.com || 
+        sudo ntpdate time.apple.com || 
+        sudo ntpdate pool.ntp.org
+    }
+    
+    # 将时间同步写入硬件时钟
+    echo "更新硬件时钟..."
+    sudo hwclock --systohc
+    
+    # 显示当前时间
+    echo "当前系统时间:"
+    date
+    
+    # 启用NTP自动同步
+    echo "启用NTP自动同步..."
+    sudo timedatectl set-ntp true
+    
+    # 显示时间同步状态
+    timedatectl status
+    
+    echo "时间同步完成!"
+    return 0
+}
+
 # 主菜单循环
 while true; do
     clear
@@ -423,10 +473,11 @@ while true; do
 6. 后台运行程序（后台持续运行）
 7. 查看运行日志
 8. 重新连接抢购界面（断线重连）
+9. 同步系统时间到UTC+8
 0. 退出安装脚本
 ============================
 """
-    read -p "请选择操作 (0-8): " choice
+    read -p "请选择操作 (0-9): " choice
     case $choice in
         1)
             check_dependencies
@@ -519,6 +570,10 @@ while true; do
                 echo "请先使用选项6启动程序"
                 read -p "按回车键继续..."
             fi
+            ;;
+        9)
+            sync_system_time
+            read -p "按回车键继续..."
             ;;
         0)
             echo "退出安装脚本"
