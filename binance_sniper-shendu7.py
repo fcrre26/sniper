@@ -489,6 +489,7 @@ class ExecutionController:
         self.depth_analyzer = depth_analyzer
         self.monitor = monitor
         self.waiter = PreciseWaiter()
+        self.market_cache = None
         
     async def execute_snipe(self,
                           client,
@@ -499,6 +500,10 @@ class ExecutionController:
                           concurrent_orders: int = 3) -> Optional[Dict]:
         """执行抢购"""
         try:
+            # 初始化市场数据缓存
+            self.market_cache = MarketDataCache(client)
+            await self.market_cache.start(symbol)
+            
             print("\n=== 开始执行抢购任务 ===")
             print(f"交易对: {symbol}")
             print(f"买入金额: {format_number(amount)} USDT")
@@ -661,6 +666,10 @@ class ExecutionController:
             logger.error(f"抢购执行失败: {str(e)}")
             print(f"\n❌ 抢购执行失败: {str(e)}")
             return None
+        finally:
+            # 确保停止数据更新
+            if self.market_cache:
+                await self.market_cache.stop()
 
     def _is_price_safe(self, current_price: float, target_price: float) -> bool:
         """检查价格是否在安全范围内"""
@@ -1101,26 +1110,66 @@ class BinanceSniper:
         'POOR': 500       # 较差: >200ms
     }
     
-    def __init__(self, config: ConfigManager):
-        self.config = config
-        self._resources = set()
-        self.performance_stats = defaultdict(list)
-        self.is_test_mode = False
+    def __init__(self,
+                 symbol: str,
+                 trade_client,
+                 query_client,
+                 amount: float = None,
+                 sell_strategy: List[Tuple[float, float]] = None):
+        self.symbol = symbol
+        self.trade_client = trade_client
+        self.query_client = query_client
+        self.amount = amount
+        self.sell_strategy = sell_strategy or [(0.2, 0.3), (0.5, 0.35), (1.0, 0.35)]
+        self.market_cache = None  # 添加market_cache属性
         
-        # 基础配置
-        self.trade_client = None
-        self.query_client = None
-        self.ws_client = None
-        self.symbol = None
-        self.amount = None
-        self.price = None
-        self.opening_time = None
-        
-        # 设置时区
-        self.timezone = pytz.timezone('Asia/Shanghai')
-        
-        # 尝试加载API配置
-        self.load_api_keys()
+    async def start_market_cache(self):
+        """启动市场数据缓存"""
+        if not self.market_cache:
+            self.market_cache = MarketDataCache(self.query_client)
+            await self.market_cache.start(self.symbol)
+            
+    async def stop_market_cache(self):
+        """停止市场数据缓存"""
+        if self.market_cache:
+            await self.market_cache.stop()
+            self.market_cache = None
+            
+    async def monitor_position(self, order_id: str):
+        """监控持仓位置"""
+        try:
+            # 启动市场数据缓存
+            await self.start_market_cache()
+            
+            # 创建异常行情监控器
+            opportunity_monitor = MarketOpportunityMonitor(
+                self.market_cache,
+                self.entry_price,
+                self.total_amount
+            )
+            
+            while True:
+                # 检查异常行情机会
+                opportunity = await opportunity_monitor.check_opportunity()
+                if opportunity:
+                    # 计算预期收益
+                    expected_profit = opportunity['expected_profit']
+                    total_profit = sum(profit for _, profit in self.profits)
+                    
+                    if expected_profit > total_profit:
+                        # 执行抢卖
+                        sell_price = opportunity['sell_price']
+                        await self.execute_sell(sell_price)
+                        break
+                
+                await asyncio.sleep(0.001)  # 1ms检查间隔
+            
+        except Exception as e:
+            logger.error(f"监控持仓失败: {str(e)}")
+            print(f"\n❌ 监控持仓失败: {str(e)}")
+        finally:
+            # 确保停止数据缓存
+            await self.stop_market_cache()
         
     def _init_clients(self) -> bool:
         """初始化交易和查询客户端"""
@@ -1939,122 +1988,61 @@ class BinanceSniper:
         except Exception as e:
             logger.error(f"保存交易历史失败: {str(e)}")
 
-    def monitor_position(self, order_id: str):
+    async def start_market_cache(self):
+        """启动市场数据缓存"""
+        if not self.market_cache:
+            self.market_cache = MarketDataCache(self.query_client)
+            await self.market_cache.start(self.symbol)
+            
+    async def stop_market_cache(self):
+        """停止市场数据缓存"""
+        if self.market_cache:
+            await self.market_cache.stop()
+            self.market_cache = None
+            
+    async def monitor_position(self, order_id: str):
         """监控持仓位置"""
         try:
-            order = self.query_client.fetch_order(order_id, self.symbol)
-            if order['status'] != 'closed':
-                return
-                
-            entry_price = float(order['average'])
-            total_amount = float(order['amount'])
-            initial_cost = entry_price * total_amount
-            remaining_amount = total_amount
-            sold_ladders = set()
-            total_realized_profit = 0
+            # 启动市场数据缓存
+            await self.start_market_cache()
             
-            print("\n[止盈触发监控]")
-            print(f"初始持仓: {format_number(total_amount)} {self.symbol.split('/')[0]}")
-            print(f"平均成本: {format_number(entry_price)} USDT")
-            print(f"总投入: {format_number(initial_cost)} USDT\n")
+            # 创建异常行情监控器
+            opportunity_monitor = MarketOpportunityMonitor(
+                self.market_cache,
+                self.entry_price,
+                self.total_amount
+            )
             
-            for i, (target_price, sell_ratio) in enumerate(self.sell_strategy, 1):
-                sell_price = entry_price * (1 + target_price)
-                sell_amount = total_amount * sell_ratio
-                
-                print(f">>> 第{i}档止盈触发 <<<")
-                print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"触发价格: {format_number(sell_price)} USDT (+{target_price*100:.0f}%)")
-                
-                try:
-                    sell_order = self.trade_client.create_market_sell_order(
-                        symbol=self.symbol,
-                        amount=sell_amount
-                    )
+            while True:
+                # 检查异常行情机会
+                opportunity = await opportunity_monitor.check_opportunity()
+                if opportunity:
+                    # 计算预期收益
+                    expected_profit = opportunity['expected_profit']
+                    total_profit = sum(profit for _, profit in self.profits)
                     
-                    if sell_order['status'] == 'closed':
-                        actual_price = float(sell_order['average'])
-                        actual_amount = float(sell_order['filled'])
-                        sell_value = actual_price * actual_amount
-                        cost_basis = entry_price * actual_amount
-                        realized_profit = sell_value - cost_basis
-                        total_realized_profit += realized_profit
-                        
-                        print("✓ 卖出成功")
-                        print(f"  - 卖出数量: {format_number(actual_amount)} {self.symbol.split('/')[0]}")
-                        print(f"  - 成交均价: {format_number(actual_price)} USDT")
-                        print(f"  - 成交金额: {format_number(sell_value)} USDT")
-                        print(f"  - 实现盈利: +{format_number(realized_profit)} USDT\n")
-                        
-                        remaining_amount -= actual_amount
-                        print(f"剩余持仓: {format_number(remaining_amount)} {self.symbol.split('/')[0]}")
-                        print(f"当前盈亏: +{format_number(total_realized_profit)} USDT (已实现)\n")
-                        
-                except Exception as e:
-                    print(f"❌ 卖出失败: {str(e)}\n")
-            
-            # 最终交易统计
-            print("[最终交易统计]")
-            print("=== 买入明细 ===")
-            print(f"• 买入均价: {format_number(entry_price)} USDT")
-            print(f"• 买入数量: {format_number(total_amount)} {self.symbol.split('/')[0]}")
-            print(f"• 买入金额: {format_number(initial_cost)} USDT")
-            print(f"• 交易手续费: {format_number(initial_cost * 0.001)} USDT\n")
-            
-            print("=== 卖出明细 ===")
-            total_sell_value = 0
-            for i, (target_price, sell_ratio) in enumerate(self.sell_strategy, 1):
-                sell_price = entry_price * (1 + target_price)
-                sell_amount = total_amount * sell_ratio
-                sell_value = sell_price * sell_amount
-                total_sell_value += sell_value
-                print(f"• 第{i}档: {format_number(sell_amount)} {self.symbol.split('/')[0]} @ {format_number(sell_price)} USDT = {format_number(sell_value)} USDT")
-            
-            print(f"• 总卖出金额: {format_number(total_sell_value)} USDT")
-            sell_fee = total_sell_value * 0.001
-            print(f"• 交易手续费: {format_number(sell_fee)} USDT\n")
-            
-            # 计算总体盈利情况
-            total_fee = initial_cost * 0.001 + sell_fee
-            net_profit = total_sell_value - initial_cost - total_fee
-            roi = (net_profit / initial_cost) * 100
-            
-            print("=== 盈利统计 ===")
-            print(f"• 总投入: {format_number(initial_cost)} USDT")
-            print(f"• 总收回: {format_number(total_sell_value)} USDT")
-            print(f"• 总手续费: {format_number(total_fee)} USDT")
-            print(f"• 净盈利: {format_number(net_profit)} USDT")
-            print(f"• 投资回报率: +{roi:.2f}%")
-            print(f"• 持仓时间: {int((time.time() - order['timestamp']/1000)/60)}分钟\n")
-            
-            print("[交易总结]")
-            print("✓ 抢购策略执行成功")
-            print("✓ 分批止盈全部触发")
-            print("✓ 获得理想收益")
-            print("✓ 风险控制有效\n")
-            
-            print("建议:")
-            print("1. 记录成功策略参数")
-            print("2. 分析市场行为特征")
-            print("3. 为下次抢购优化策略")
+                    if expected_profit > total_profit:
+                        # 执行抢卖
+                        sell_price = opportunity['sell_price']
+                        await self.execute_sell(sell_price)
+                        break
                 
+                await asyncio.sleep(0.001)  # 1ms检查间隔
+            
         except Exception as e:
             logger.error(f"监控持仓失败: {str(e)}")
             print(f"\n❌ 监控持仓失败: {str(e)}")
+        finally:
+            # 确保停止数据缓存
+            await self.stop_market_cache()
 
-    def close_position(self, reason: str):
-        """平仓"""
-        try:
-            order = self.trade_client.create_market_sell_order(
-                symbol=self.symbol,
-                amount=self.amount
-            )
-            logger.info(f"{reason}, 平仓成功: {order}")
-            self.save_trade_history(order)
-            return order
-        except Exception as e:
-            logger.error(f"平仓失败: {str(e)}")
-            return None
+    def _is_price_safe(self, current_price: float, target_price: float) -> bool:
+        """检查价格是否在安全范围内"""
+        deviation = abs(current_price - target_price) / target_price
+        if deviation > self.max_price_deviation:
+            logger.warning(f"价格偏差过大: 目标 {target_price}, 当前 {current_price}, 偏差 {deviation*100:.2f}%")
+            return False
+        return True
 
     def analyze_market_depth(self) -> dict:
         """分析市场深度，识别异常订单"""
