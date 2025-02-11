@@ -75,92 +75,39 @@ check_dependencies() {
     echo "正在检查依赖..."
     
     # 首先检查Python版本
-    check_python_version || return $ERR_DEPENDENCY
+    check_python_version || {
+        echo "Python版本检查失败"
+        read -p "按回车键继续..."
+        return $ERR_DEPENDENCY
+    }
     
     # 检查系统资源
-    check_system_resources || return $ERR_SYSTEM
+    check_system_resources || {
+        echo "系统资源检查失败"
+        read -p "按回车键继续..."
+        return $ERR_SYSTEM
+    }
     
     # 检查网络连接
-    check_network || return $ERR_SYSTEM
+    check_network || {
+        echo "网络连接检查失败"
+        read -p "按回车键继续..."
+        return $ERR_SYSTEM
+    }
     
-    local need_install=false
+    echo "开始检查Python包..."
     
-    # 检查Python依赖
-    python3 -c "
-try:
-    import ccxt
-    print('CCXT: 已安装 ✓')
-except ImportError:
-    print('CCXT: 未安装 ✗')
-    exit(1)
+    # 使用python3 -c命令检查每个包，并在每次检查后暂停
+    for package in "ccxt" "websocket" "websockets" "requests" "pytz" "aiohttp" "prometheus_client" "psutil" "numba" "numpy"; do
+        echo -n "检查 $package: "
+        python3 -c "import $package" 2>/dev/null && echo "已安装 ✓" || {
+            echo "未安装 ✗"
+            need_install=true
+        }
+    done
 
-try:
-    import websocket
-    print('WebSocket-Client: 已安装 ✓')
-except ImportError:
-    print('WebSocket-Client: 未安装 ✗')
-    exit(2)
-
-try:
-    import websockets
-    print('WebSockets: 已安装 ✓')
-except ImportError:
-    print('WebSockets: 未安装 ✗')
-    exit(3)
-
-try:
-    import requests
-    print('Requests: 已安装 ✓')
-except ImportError:
-    print('Requests: 未安装 ✗')
-    exit(4)
-
-try:
-    import pytz
-    print('PyTZ: 已安装 ✓')
-except ImportError:
-    print('PyTZ: 未安装 ✗')
-    exit(5)
-
-try:
-    import aiohttp
-    print('AIOHTTP: 已安装 ✓')
-except ImportError:
-    print('AIOHTTP: 未安装 ✗')
-    exit(6)
-
-try:
-    import prometheus_client
-    print('Prometheus-Client: 已安装 ✓')
-except ImportError:
-    print('Prometheus-Client: 未安装 ✗')
-    exit(7)
-
-try:
-    import psutil
-    print('PSUtil: 已安装 ✓')
-except ImportError:
-    print('PSUtil: 未安装 ✗')
-    exit(8)
-
-try:
-    import numba
-    print('Numba: 已安装 ✓')
-except ImportError:
-    print('Numba: 未安装 ✗')
-    exit(9)
-
-try:
-    import numpy
-    print('NumPy: 已安装 ✓')
-except ImportError:
-    print('NumPy: 未安装 ✗')
-    exit(10)
-"
-    local check_result=$?
-    
-    if [ $check_result -ne 0 ]; then
-        echo "发现未安装的依赖，是否现在安装? (y/n)"
+    if [ "$need_install" = true ]; then
+        echo -e "\n发现未安装的依赖，是否现在安装? (y/n)"
         read -p "请选择: " install_choice
         if [[ $install_choice == "y" || $install_choice == "Y" ]]; then
             install_dependencies
@@ -170,29 +117,37 @@ except ImportError:
         fi
     fi
     
+    # 检查目录和文件
+    echo -e "\n检查必要的目录和文件..."
+    
     # 检查配置目录
     if [ ! -d "config" ]; then
         mkdir -p config
+        echo "创建配置目录 ✓"
+    else
+        echo "配置目录已存在 ✓"
     fi
     
     # 检查日志目录
     if [ ! -d "logs" ]; then
         mkdir -p logs
+        echo "创建日志目录 ✓"
+    else
+        echo "日志目录已存在 ✓"
     fi
     
     # 检查配置文件
     if [ -f "config/config.ini" ]; then
-        echo "配置文件: 已存在 ✓"
+        echo "配置文件已存在 ✓"
     else
-        echo "配置文件: 未创建 ✗"
-        echo "配置文件将在首次运行时自动创建"
+        echo "配置文件未创建 (首次运行时将自动创建) ✗"
     fi
     
     # 检查主程序
     if [ -f "binance_sniper.py" ]; then
-        echo "主程序: 已存在 ✓"
+        echo "主程序已存在 ✓"
     else
-        echo "主程序: 未下载 ✗"
+        echo "主程序未下载 ✗"
         echo "是否现在下载主程序? (y/n)"
         read -p "请选择: " download_choice
         if [[ $download_choice == "y" || $download_choice == "Y" ]]; then
@@ -200,7 +155,7 @@ except ImportError:
         fi
     fi
     
-    echo "依赖检查完成!"
+    echo -e "\n依赖检查完成!"
     read -p "按回车键继续..."
 }
 
