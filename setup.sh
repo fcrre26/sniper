@@ -207,24 +207,48 @@ except ImportError:
 # 下载主程序函数
 download_main_program() {
     echo "正在下载主程序..."
-    # 使用正确的 GitHub 地址
-    curl -o binance_sniper.py https://raw.githubusercontent.com/fcrre26/sniper/refs/heads/main/binance_sniper.py
+    
+    # 检查是否已存在，如果存在先备份
+    if [ -f "binance_sniper.py" ]; then
+        echo "发现已存在的程序文件，创建备份..."
+        cp binance_sniper.py binance_sniper.py.bak
+    fi
+    
+    # 尝试使用 curl 下载
+    echo "尝试使用 curl 下载..."
+    curl -L -o binance_sniper.py https://raw.githubusercontent.com/fcrre26/sniper/refs/heads/main/binance_sniper.py
     
     if [ $? -ne 0 ]; then
-        echo "下载失败，尝试使用备用方法..."
+        echo "curl 下载失败，尝试使用 wget..."
         # 备用下载方法，使用 wget
-        wget -O binance_sniper.py https://raw.githubusercontent.com/fcrre26/sniper/refs/heads/main/binance_sniper.py
+        wget --no-check-certificate -O binance_sniper.py https://raw.githubusercontent.com/fcrre26/sniper/refs/heads/main/binance_sniper.py
         
         if [ $? -ne 0 ]; then
-            echo "下载失败，请检查网络连接或手动下载"
-            echo "手动下载地址: https://raw.githubusercontent.com/fcrre26/sniper/refs/heads/main/binance_sniper.py"
-            return $ERR_DOWNLOAD
+            echo "下载失败，尝试恢复备份..."
+            if [ -f "binance_sniper.py.bak" ]; then
+                mv binance_sniper.py.bak binance_sniper.py
+                echo "已恢复备份文件"
+                return $SUCCESS
+            else
+                echo "错误: 下载失败且无备份可恢复"
+                echo "请手动下载文件到当前目录:"
+                echo "https://raw.githubusercontent.com/fcrre26/sniper/refs/heads/main/binance_sniper.py"
+                return $ERR_DOWNLOAD
+            fi
         fi
     fi
     
-    chmod +x binance_sniper.py
-    echo "主程序下载成功"
-    return $SUCCESS
+    # 检查文件是否下载成功
+    if [ -f "binance_sniper.py" ]; then
+        chmod +x binance_sniper.py
+        echo "主程序下载成功 ✓"
+        # 清理备份
+        [ -f "binance_sniper.py.bak" ] && rm binance_sniper.py.bak
+        return $SUCCESS
+    else
+        echo "错误: 文件下载失败"
+        return $ERR_DOWNLOAD
+    fi
 }
 
 # 安装依赖函数
@@ -242,7 +266,7 @@ install_dependencies() {
     # 安装依赖包
     echo "正在安装依赖包..."
     pip install -U pip setuptools wheel
-    pip install ccxt                # 加密货币交易所API
+    pip install ccxt                # 加密货币交所API
     pip install websocket-client    # WebSocket客户端
     pip install websockets         # WebSocket异步客户端
     pip install requests           # HTTP请求库
@@ -267,8 +291,8 @@ install_dependencies() {
 install_service() {
     echo "正在安装系统服务..."
     
-    # 创建服务文件
-    sudo cat > /etc/systemd/system/binance-sniper.service << EOF
+    # 创建临时服务文件
+    cat > binance-sniper.service.tmp << EOF
 [Unit]
 Description=Binance Sniper Service
 After=network.target
@@ -296,12 +320,15 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
+    # 使用sudo移动服务文件
+    sudo mv binance-sniper.service.tmp /etc/systemd/system/binance-sniper.service
+
     # 创建日志目录
     sudo mkdir -p /var/log/binance-sniper
     sudo chown $USER:$USER /var/log/binance-sniper
 
-    # 创建日志轮转配置
-    sudo cat > /etc/logrotate.d/binance-sniper << EOF
+    # 创建临时日志轮转配置
+    cat > binance-sniper.logrotate.tmp << EOF
 /var/log/binance-sniper/*.log {
     daily
     rotate 7
@@ -313,6 +340,13 @@ EOF
 }
 EOF
 
+    # 使用sudo移动日志轮转配置
+    sudo mv binance-sniper.logrotate.tmp /etc/logrotate.d/binance-sniper
+
+    # 设置正确的权限
+    sudo chmod 644 /etc/systemd/system/binance-sniper.service
+    sudo chmod 644 /etc/logrotate.d/binance-sniper
+
     # 重新加载systemd配置
     sudo systemctl daemon-reload
 
@@ -320,13 +354,12 @@ EOF
     sudo systemctl enable binance-sniper.service
 
     echo """
-=== 服务安装完成 ===
-使用以下命令控制服务:
+服务安装完成！
+使用以下命令管理服务：
 - 启动: sudo systemctl start binance-sniper
 - 停止: sudo systemctl stop binance-sniper
 - 状态: sudo systemctl status binance-sniper
 - 查看日志: tail -f /var/log/binance-sniper/output.log
-- 查看错误: tail -f /var/log/binance-sniper/error.log
 """
 }
 
@@ -431,13 +464,14 @@ while true; do
 2. 安装/更新依赖
 3. 测试API延迟
 4. 安装系统服务
-5. 立即运行程序
-6. 后台运行程序
+5. 立即运行程序（前端运行）
+6. 后台运行程序（后台持续运行）
 7. 查看运行日志
+8. 重新连接抢购界面（断线重连）
 0. 退出安装脚本
 ============================
 """
-    read -p "请选择操作 (0-7): " choice
+    read -p "请选择操作 (0-8): " choice
     case $choice in
         1)
             check_dependencies
@@ -465,21 +499,69 @@ while true; do
                 read -p "按回车键继续..."
                 continue
             fi
+
+            # 检查 screen 是否安装
+            if ! command -v screen &> /dev/null; then
+                echo "正在安装 screen..."
+                sudo apt-get update && sudo apt-get install -y screen || {
+                    echo "screen 安装失败，无法使用后台运行功能"
+                    read -p "按回车键继续..."
+                    continue
+                }
+            fi
+
+            # 检查已存在的 screen 会话
+            if screen -ls | grep -q "sniper"; then
+                echo "发现已存在的后台会话，是否重新连接? (y/n)"
+                read -p "请选择: " reconnect_choice
+                if [[ $reconnect_choice == "y" || $reconnect_choice == "Y" ]]; then
+                    screen -r sniper
+                    continue
+                else
+                    echo "是否结束已存在的会话并重新启动? (y/n)"
+                    read -p "请选择: " restart_choice
+                    if [[ $restart_choice == "y" || $restart_choice == "Y" ]]; then
+                        screen -X -S sniper quit
+                    else
+                        continue
+                    fi
+                fi
+            fi
+
             echo """
 === 后台运行说明 ===
 1. 程序会在前台启动，您可以进行设置
 2. 即使SSH意外断开，程序也会继续在后台运行
 3. 重新连接服务器后，使用 screen -r sniper 可以重新查看程序
 4. 主动退出请在程序中选择0退出
+5. 临时退出screen会话请按 Ctrl+A+D
 """
             read -p "按回车键开始运行..."
-            screen -RR sniper python3 binance_sniper.py
+            
+            # 启动新的 screen 会话
+            screen -dmS sniper
+            screen -S sniper -X stuff "python3 binance_sniper.py\n"
+            screen -r sniper
             ;;
         7)
             if [ -f "/var/log/binance-sniper/output.log" ]; then
                 tail -f /var/log/binance-sniper/output.log
             else
                 echo "错误: 日志文件不存在"
+                read -p "按回车键继续..."
+            fi
+            ;;
+        8)
+            echo "正在检查运行中的程序..."
+            if screen -ls | grep -q "sniper"; then
+                echo "发现运行中的程序，正在重新连接..."
+                # 先尝试分离可能存在的其他连接
+                screen -d sniper 2>/dev/null
+                # 重新连接到会话
+                screen -r sniper
+            else
+                echo "未发现运行中的程序!"
+                echo "请先使用选项6启动程序"
                 read -p "按回车键继续..."
             fi
             ;;
