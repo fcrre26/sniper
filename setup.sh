@@ -207,11 +207,21 @@ except ImportError:
 # 下载主程序函数
 download_main_program() {
     echo "正在下载主程序..."
+    # 使用正确的 GitHub 地址
     curl -o binance_sniper.py https://raw.githubusercontent.com/fcrre26/sniper/refs/heads/main/binance_sniper.py
+    
     if [ $? -ne 0 ]; then
-        echo "下载失败，请检查网络连接"
-        return $ERR_DOWNLOAD
+        echo "下载失败，尝试使用备用方法..."
+        # 备用下载方法，使用 wget
+        wget -O binance_sniper.py https://raw.githubusercontent.com/fcrre26/sniper/refs/heads/main/binance_sniper.py
+        
+        if [ $? -ne 0 ]; then
+            echo "下载失败，请检查网络连接或手动下载"
+            echo "手动下载地址: https://raw.githubusercontent.com/fcrre26/sniper/refs/heads/main/binance_sniper.py"
+            return $ERR_DOWNLOAD
+        fi
     fi
+    
     chmod +x binance_sniper.py
     echo "主程序下载成功"
     return $SUCCESS
