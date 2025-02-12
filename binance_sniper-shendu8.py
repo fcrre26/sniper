@@ -43,6 +43,7 @@ import inspect  # 用于运行时检查
 import socket
 import subprocess
 import netifaces
+import websockets
 
 # 获取当前脚本所在目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -209,6 +210,40 @@ class IPManager:
                 if stats['errors'] >= self.error_threshold:
                     self.logger.warning(f"IP {ip} 错误次数过多，将被临时禁用")
 
+    async def get_next_ip(self):
+        """获取下一个可用IP"""
+        async with self.lock:
+            # 按时间窗口选择IP
+            current_second = int(time.time()) % 60
+            for ip in self.ips:
+                if (self.ip_stats[ip]['window_start'] <= current_second < 
+                    self.ip_stats[ip]['window_end']):
+                    return ip
+            
+            # 如果没有找到合适的IP，使用轮询方式
+            self.current_ip_index = (self.current_ip_index + 1) % len(self.ips)
+            return self.ips[self.current_ip_index]
+
+    async def get_best_ip(self):
+        """获取当前最佳IP"""
+        best_ip = None
+        best_score = float('inf')
+        
+        for ip in self.ips:
+            stats = self.ip_stats[ip]
+            # 计算综合得分 (越低越好)
+            score = (
+                stats['latency'] * 0.4 +  # 延迟权重
+                (stats['errors'] / max(stats['requests'], 1)) * 100 * 0.3 +  # 错误率权重
+                (time.time() - stats['last_used']) * 0.3  # 负载均衡权重
+            )
+            
+            if score < best_score:
+                best_score = score
+                best_ip = ip
+        
+        return best_ip or self.ips[0]
+
 class RequestScheduler:
     """请求调度器 - 实现精确的时间窗口和请求控制"""
     def __init__(self):
@@ -361,7 +396,7 @@ class RequestScheduler:
 class BinanceWebSocketManager:
     """优化后的WebSocket管理器"""
     def __init__(self, symbol: str, logger=None):
-        self.symbol = symbol.lower()
+        self.symbol = symbol.lower().replace('/', '').lower()  # 格式化交易对
         self.logger = logger or logging.getLogger(__name__)
         self.connections = {}
         self.data_callbacks = []
@@ -370,32 +405,44 @@ class BinanceWebSocketManager:
         self.last_data = {}
         self.scheduler = RequestScheduler()
         self.latency_stats = {}
-        self.LATENCY_WINDOW = 1000  # 保留1000个延迟样本
+        self.LATENCY_WINDOW = 1000
+        
+        # 添加高频数据缓存
+        self.realtime_data = {
+            'bookTicker': None,
+            'trade': None,
+            'depth': None
+        }
+        
+        # 添加性能统计
+        self.stats = {
+            'bookTicker_latency': deque(maxlen=1000),
+            'trade_latency': deque(maxlen=1000),
+            'message_count': 0
+        }
 
     async def add_connection(self, ip: str):
         """为指定IP添加WebSocket连接"""
         try:
+            # 正确格式化streams
             streams = [
-                f"{self.symbol}@bookTicker",
-                f"{self.symbol}@depth@100ms"
+                f"{self.symbol}@trade",         # 逐笔交易
+                f"{self.symbol}@depth@100ms",   # 增量深度信息
+                f"{self.symbol}@bookTicker"     # 最优挂单信息
             ]
-            url = f"wss://stream.binance.com:9443/ws/{'/'.join(streams)}"
             
-            self.connections[ip] = {
-                'ws': await websocket.connect(url, source_address=(ip, 0)),
-                'last_msg': time.time(),
-                'active': True,
-                'latency': deque(maxlen=self.LATENCY_WINDOW)
-            }
+            # 使用_connect_websocket建立连接
+            ws = await self._connect_websocket(ip, streams)
             
-            asyncio.create_task(self._handle_messages(ip))
-            asyncio.create_task(self._monitor_connection(ip))
-            
-            self.logger.info(f"WebSocket连接已建立 (IP: {ip})")
+            # 连接成功后的处理
+            if ws:
+                self.logger.info(f"WebSocket连接已建立 (IP: {ip})")
+                return True
+            return False
             
         except Exception as e:
             self.logger.error(f"WebSocket连接失败 (IP: {ip}): {e}")
-            raise
+            return False
 
     async def _handle_messages(self, ip: str):
         """处理WebSocket消息"""
@@ -406,35 +453,38 @@ class BinanceWebSocketManager:
                 message = await ws_conn['ws'].recv()
                 data = json.loads(message)
                 
-                receive_time = time.time()
-                event_time = data.get('E', 0) / 1000
-                latency = receive_time - event_time
+                # 更新最后消息时间
+                ws_conn['last_msg'] = time.time()
                 
-                ws_conn['latency'].append(latency)
+                # 计算延迟
+                if 'E' in data:  # 事件时间
+                    receive_time = time.time() * 1000
+                    event_time = data['E']
+                    latency = receive_time - event_time
+                    ws_conn['latency'].append(latency)
                 
-                async with self.lock:
-                    if data.get('e') == 'bookTicker':
-                        self.last_data['bookTicker'] = {
-                            'data': data,
-                            'timestamp': receive_time,
-                            'latency': latency,
-                            'ip': ip
-                        }
-                    elif 'depthUpdate' in message:
-                        self.last_data['depth'] = {
-                            'data': data,
-                            'timestamp': receive_time,
-                            'latency': latency,
-                            'ip': ip
-                        }
-                        
+                # 更新消息计数
+                self.stats['message_count'] += 1
+                
+                # 根据消息类型更新数据
+                if 'e' in data:
+                    stream_type = data['e']
+                    if stream_type == 'trade':
+                        self.realtime_data['trade'] = data
+                    elif stream_type == 'depthUpdate':
+                        self.realtime_data['depth'] = data
+                    elif stream_type == 'bookTicker':
+                        self.realtime_data['bookTicker'] = data
+                
+                # 回调处理
                 for callback in self.data_callbacks:
-                    await callback(data, ip, latency)
-                    
-                ws_conn['last_msg'] = receive_time
+                    try:
+                        await callback(data)
+                    except Exception as e:
+                        self.logger.error(f"回调处理错误: {e}")
                 
             except Exception as e:
-                self.logger.error(f"WebSocket消息处理错误 (IP: {ip}): {e}")
+                self.logger.error(f"WebSocket消息处理错误 (IP: {ip}): {str(e)}")
                 ws_conn['active'] = False
                 break
 
@@ -524,6 +574,80 @@ class BinanceWebSocketManager:
         except Exception as e:
             self.logger.error(f"WebSocket重连失败 (IP: {ip}): {e}")
             return False
+
+    async def _connect_websocket(self, ip, streams):
+        try:
+            # 修改 streams 格式
+            formatted_streams = []
+            for stream in streams:
+                if '@' not in stream:  # 如果stream中没有@符号，说明需要格式化
+                    formatted_streams.append(f"{stream.lower()}@trade")
+                else:
+                    formatted_streams.append(stream.lower())
+                
+            url = f"wss://stream.binance.com:9443/ws"  # 修改为基础URL
+            
+            # 建立 WebSocket 连接
+            ws = await websockets.connect(
+                url,
+                origin="https://stream.binance.com",
+                host="stream.binance.com",
+                local_addr=(ip, 0),
+                ssl=True,
+                ping_interval=20,
+                ping_timeout=60,
+                compression=None  # 禁用压缩以避免潜在问题
+            )
+            
+            self.connections[ip] = {
+                'ws': ws,
+                'last_msg': time.time(),
+                'active': True,
+                'latency': deque(maxlen=self.LATENCY_WINDOW)
+            }
+            
+            # 修改订阅消息格式
+            subscribe_msg = {
+                "method": "SUBSCRIBE",
+                "params": formatted_streams,
+                "id": int(time.time() * 1000)
+            }
+            
+            # 发送订阅消息
+            await ws.send(json.dumps(subscribe_msg))
+            
+            # 等待并验证订阅确认
+            while True:
+                response = await ws.recv()
+                response_data = json.loads(response)
+                
+                # 检查是否是订阅确认消息
+                if 'id' in response_data:
+                    if response_data.get('result') is None:
+                        asyncio.create_task(self._handle_messages(ip))
+                        asyncio.create_task(self._monitor_connection(ip))
+                        self.logger.info(f"WebSocket连接已建立并订阅成功 (IP: {ip})")
+                        break
+                    else:
+                        error_msg = response_data.get('error', {}).get('msg', '未知错误')
+                        raise Exception(f"订阅失败: {error_msg}")
+                else:
+                    # 如果收到的是数据消息而不是订阅确认，继续等待
+                    continue
+
+        except Exception as e:
+            self.logger.error(f"WebSocket连接或订阅失败 (IP: {ip}): {str(e)}")
+            if ip in self.connections:
+                self.connections[ip]['active'] = False
+                if 'ws' in self.connections[ip]:
+                    try:
+                        await self.connections[ip]['ws'].close()
+                    except:
+                        pass
+                del self.connections[ip]  # 删除失败的连接
+            raise
+
+        return ws
 
 def setup_logger():
     """配置日志系统"""
@@ -1308,6 +1432,18 @@ class BinanceSniper:
         
         # 9. 资源跟踪
         self._resources = set()
+        
+        # 10. 添加性能测试相关的基础配置
+        self.request_interval = 0.05  # 50ms 默认请求间隔
+        self.max_retries = 3         # 默认重试次数
+        self.timeout = 5.0           # 默认超时时间(秒)
+        
+        # 11. 请求限制配置
+        self.rate_limits = {
+            'weight': 1200,          # 每分钟权重限制
+            'orders': 50,            # 每10秒订单限制
+            'request_window': 60     # 时间窗口(秒)
+        }
         
         self.logger.info("BinanceSniper初始化完成")
 
@@ -5240,71 +5376,287 @@ class BinanceSniper:
             raise ExecutionError(f"订单执行失败: {str(e)}")
 
     async def test_performance(self, duration=120):
-        """测试当前配置的性能
-        duration: 测试持续时间（秒）
-        """
-        print(f"\n开始性能测试 (持续{duration}秒)...")
-        start_time = time.time()
-        success_count = 0
-        error_count = 0
-        latencies = []
-        last_report = start_time
-        last_success = 0
+        """测试当前配置的性能"""
+        print(f"\n=== 开始性能测试 (持续{duration}秒) ===")
+        
+        # 确保使用实盘模式
+        self.trade_client.set_sandbox_mode(False)
+        self.query_client.set_sandbox_mode(False)
+        
+        # 如果没有设置交易对，使用默认的 BTC/USDT
+        if not self.symbol:
+            self.symbol = 'BTC/USDT'
+            print(f"未设置交易对，使用默认交易对: {self.symbol}")
+        
+        # 初始化 WebSocket 连接
+        if not hasattr(self, 'ws_manager') or not self.ws_manager:
+            print("初始化 WebSocket 连接...")
+            self.ws_manager = BinanceWebSocketManager(self.symbol, self.logger)
+            # 等待连接建立
+            for ip in self.ip_manager.ips:
+                try:
+                    await self.ws_manager.add_connection(ip)
+                    print(f"✓ WebSocket 连接已建立 (IP: {ip})")
+                    # 添加短暂延迟确保连接完全建立
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    print(f"✗ WebSocket 连接失败 (IP: {ip}): {e}")
+                    continue
+        
+        # 显示当前配置
+        print("\n当前系统配置:")
+        print(f"• 交易对: {self.symbol}")
+        print(f"• API类型: 实盘模式")
+        print(f"• 可用IP: {len(self.ip_manager.ips)}个")
+        for ip in self.ip_manager.ips:
+            print(f"  - {ip}")
+        print(f"• WebSocket连接: {'已启用' if hasattr(self, 'ws_manager') else '未启用'}")
+        print("\n开始测试...\n")
 
-        try:
+        # 初始化统计数据
+        stats = {
+            'latencies': [],
+            'success_count': 0,
+            'error_count': 0,
+            'errors': defaultdict(int),
+            'min_latency': float('inf'),
+            'max_latency': 0,
+            'last_report': time.time(),
+            'last_success': 0,
+            'requests_per_second': [],
+            'ws_messages': 0
+        }
+
+        start_time = time.time()
+        
+        # 创建IP请求队列
+        ip_queues = {ip: asyncio.Queue() for ip in self.ip_manager.ips}
+        
+        # 创建IP请求任务
+        async def ip_worker(ip: str, queue: asyncio.Queue):
             while time.time() - start_time < duration:
                 try:
                     req_start = time.time()
-                    # 使用现有的请求逻辑
-                    await self.get_symbol_price(self.symbol)
-                    latency = (time.time() - req_start) * 1000
-                    latencies.append(latency)
-                    success_count += 1
-
-                    # 每秒报告一次状态
-                    now = time.time()
-                    if now - last_report >= 1:
-                        time_passed = now - last_report
-                        current_rate = (success_count - last_success) / time_passed * 60
-                        avg_latency = sum(latencies[-1000:]) / len(latencies[-1000:]) if latencies else 0
+                    ticker = await self.query_client.fetch_ticker(self.symbol)
+                    
+                    if ticker:
+                        latency = (time.time() - req_start) * 1000
+                        await queue.put(('success', latency))
                         
-                        print(f"\r状态更新: "
-                              f"时间: {int(now - start_time)}s/{duration}s | "
-                              f"当前速率: {current_rate:.1f} 请求/分钟 | "
-                              f"平均延迟: {avg_latency:.2f}ms | "
-                              f"成功: {success_count} | "
-                              f"错误: {error_count}", end='')
-                        
-                        last_report = now
-                        last_success = success_count
-
                 except Exception as e:
-                    error_count += 1
-                    print(f"\n请求错误: {str(e)}")
+                    await queue.put(('error', str(e)))
+                
+                # 动态调整请求间隔
+                await asyncio.sleep(0.01)  # 10ms基础间隔
+        
+        # 启动IP工作任务
+        workers = [asyncio.create_task(ip_worker(ip, queue)) 
+                  for ip, queue in ip_queues.items()]
+        
+        # 处理结果的任务
+        async def process_results():
+            while time.time() - start_time < duration:
+                for ip, queue in ip_queues.items():
+                    while not queue.empty():
+                        status, data = await queue.get()
+                        
+                        if status == 'success':
+                            latency = data
+                            stats['latencies'].append(latency)
+                            stats['success_count'] += 1
+                            stats['min_latency'] = min(stats['min_latency'], latency)
+                            stats['max_latency'] = max(stats['max_latency'], latency)
+                        else:
+                            stats['error_count'] += 1
+                            error_type = type(data).__name__
+                            stats['errors'][error_type] += 1
+                            
+                # 更新显示
+                now = time.time()
+                if now - stats['last_report'] >= 1:
+                    time_passed = now - stats['last_report']
+                    current_rate = (stats['success_count'] - stats['last_success']) / time_passed
+                    stats['requests_per_second'].append(current_rate)
+                    
+                    # 计算最近的平均延迟
+                    recent_latencies = stats['latencies'][-1000:]
+                    avg_latency = sum(recent_latencies) / len(recent_latencies) if recent_latencies else 0
+                    
+                    # 获取WebSocket消息计数
+                    if hasattr(self, 'ws_manager') and self.ws_manager and hasattr(self.ws_manager, 'stats'):
+                        stats['ws_messages'] = self.ws_manager.stats['message_count']
+                    else:
+                        stats['ws_messages'] = 0
+                    
+                    print(f"\r状态: "
+                          f"运行时间: {int(now - start_time)}s/{duration}s | "
+                          f"当前速率: {current_rate*60:.1f} 请求/分钟 | "
+                          f"平均延迟: {avg_latency:.2f}ms | "
+                          f"成功: {stats['success_count']} | "
+                          f"错误: {stats['error_count']} | "
+                          f"WS消息: {stats['ws_messages']}", end='')
+                    
+                    stats['last_report'] = now
+                    stats['last_success'] = stats['success_count']
+                
+                await asyncio.sleep(0.001)  # 避免CPU过载
 
-                # 使用现有的请求间隔逻辑
-                await asyncio.sleep(self.request_interval)
-
+        # 启动结果处理任务
+        processor = asyncio.create_task(process_results())
+        
+        try:
+            # 等待所有任务完成
+            await asyncio.gather(*workers, processor)
         except KeyboardInterrupt:
-            print("\n测试被用户中断")
+            print("\n\n测试被用户中断")
+        finally:
+            # 取消所有任务
+            for worker in workers:
+                worker.cancel()
+            processor.cancel()
 
+        # 生成详细报告
         total_time = time.time() - start_time
-        avg_rate = success_count / total_time * 60
-        avg_latency = sum(latencies) / len(latencies) if latencies else 0
+        total_requests = stats['success_count'] + stats['error_count']
+        avg_rate = stats['success_count'] / total_time * 60
+        
+        print("\n\n========== 详细测试报告 ==========")
+        print(f"\n基本信息:")
+        print(f"• 测试时长: {total_time:.1f}秒")
+        print(f"• 总请求数: {total_requests}")
+        print(f"• 成功请求: {stats['success_count']}")
+        print(f"• 失败请求: {stats['error_count']}")
+        
+        print(f"\n性能指标:")
+        print(f"• 平均速率: {avg_rate:.1f} 请求/分钟")
+        if stats['latencies']:
+            print(f"• 延迟统计:")
+            print(f"  - 最小延迟: {stats['min_latency']:.2f}ms")
+            print(f"  - 最大延迟: {stats['max_latency']:.2f}ms")
+            print(f"  - 平均延迟: {sum(stats['latencies'])/len(stats['latencies']):.2f}ms")
+            
+            # 计算延迟分位数
+            sorted_latencies = sorted(stats['latencies'])
+            p50 = sorted_latencies[len(sorted_latencies)//2]
+            p95 = sorted_latencies[int(len(sorted_latencies)*0.95)]
+            p99 = sorted_latencies[int(len(sorted_latencies)*0.99)]
+            print(f"  - 延迟分位数:")
+            print(f"    * P50: {p50:.2f}ms")
+            print(f"    * P95: {p95:.2f}ms")
+            print(f"    * P99: {p99:.2f}ms")
+        
+        print(f"\n稳定性指标:")
+        print(f"• 成功率: {(stats['success_count']/total_requests*100):.2f}%")
+        if stats['errors']:
+            print("• 错误分布:")
+            for error_type, count in stats['errors'].items():
+                print(f"  - {error_type}: {count}次 ({count/stats['error_count']*100:.1f}%)")
+        
+        if stats['requests_per_second']:
+            avg_rps = sum(stats['requests_per_second'])/len(stats['requests_per_second'])
+            print(f"\n吞吐量分析:")
+            print(f"• 平均每秒请求: {avg_rps:.1f}")
+            print(f"• 每分钟请求: {avg_rps*60:.1f}")
+        
+        print("\n系统配置:")
+        print(f"• 交易对: {self.symbol}")
+        print(f"• 可用IP数: {len(self.ip_manager.ips)}")
+        print(f"• API类型: 实盘模式")
+        print("================================")
+        print(f"\n额外统计:")
+        print(f"• WebSocket消息总数: {stats['ws_messages']}")
+        print(f"• 总数据点: {total_requests + stats['ws_messages']}")
+        print(f"• 综合每秒处理: {(total_requests + stats['ws_messages'])/total_time:.1f}")
+        print("================================")
 
-        print("\n\n========== 测试报告 ==========")
-        print(f"测试时长: {total_time:.1f}秒")
-        print(f"总请求数: {success_count + error_count}")
-        print(f"成功请求: {success_count}")
-        print(f"失败请求: {error_count}")
-        print(f"平均速率: {avg_rate:.1f} 请求/分钟")
-        print(f"平均延迟: {avg_latency:.2f}ms")
-        print(f"成功率: {(success_count/(success_count+error_count)*100):.2f}%")
-        print("\n当前配置:")
-        print(f"请求间隔: {self.request_interval}秒")
-        print(f"重试次数: {self.max_retries}")
-        print(f"超时设置: {self.timeout}秒")
-        print("============================")
+        return {
+            'duration': total_time,
+            'total_requests': total_requests,
+            'success_count': stats['success_count'],
+            'error_count': stats['error_count'],
+            'avg_latency': sum(stats['latencies'])/len(stats['latencies']) if stats['latencies'] else 0,
+            'min_latency': stats['min_latency'],
+            'max_latency': stats['max_latency'],
+            'success_rate': stats['success_count']/total_requests if total_requests > 0 else 0,
+            'requests_per_minute': avg_rate,
+            'ws_messages': stats['ws_messages']
+        }
+
+    async def run_test(self):
+        """统一测试入口"""
+        while True:
+            print("\n=== 币安测试中心 ===")
+            print("1. API性能测试")
+            print("2. 网络模拟运行")
+            print("3. WebSocket测试")
+            print("4. 全面压力测试")
+            print("0. 返回")
+            print("==================")
+            
+            try:
+                choice = input("请选择测试类型 (0-4): ").strip()
+                
+                if choice == '0':
+                    break
+                    
+                elif choice == '1':  # API性能测试
+                    print("\n--- API性能测试 ---")
+                    print("1. 快速测试 (30秒)")
+                    print("2. 标准测试 (120秒)")
+                    print("3. 长时间测试 (300秒)")
+                    print("4. 自定义时长")
+                    print("5. 返回")
+                    
+                    test_choice = input("请选择测试时长 (1-5): ").strip()
+                    if test_choice == '5':
+                        continue
+                        
+                    # 修改这里的时长选择逻辑
+                    duration = None
+                    if test_choice == '1':
+                        duration = 30
+                    elif test_choice == '2':
+                        duration = 120
+                    elif test_choice == '3':
+                        duration = 300
+                    elif test_choice == '4':
+                        try:
+                            duration = int(input("请输入测试时长(秒): "))
+                        except ValueError:
+                            print("无效的时长输入")
+                            continue
+
+                    if duration:
+                        if self._init_clients():
+                            await self.test_performance(duration)
+                        else:
+                            print("初始化客户端失败")
+                        
+                elif choice == '2':  # 网络模拟运行
+                    await self.test_network()
+                    
+                elif choice == '3':  # WebSocket测试
+                    await self.test_websocket()
+                    
+                elif choice == '4':  # 全面压力测试
+                    # 修改这里：不使用 await
+                    if self._init_clients():  # 确保客户端已初始化
+                        await self.test_performance(300)  # 5分钟完整测试
+                    else:
+                        print("初始化客户端失败")
+                    
+                else:
+                    print("无效选择")
+                    
+                input("\n按Enter继续...")
+                
+            except KeyboardInterrupt:
+                print("\n测试被用户中断")
+                break
+            except Exception as e:
+                print(f"测试执行失败: {str(e)}")
+                self.logger.error(f"测试执行失败: {str(e)}", exc_info=True)
+                input("\n按Enter继续...")
 
 class ErrorHandler:
     """统一错误处理"""
@@ -5386,7 +5738,7 @@ class ErrorHandler:
                 return await self._retry_with_backoff(retry_func)
             
             return False
-                except Exception as e:
+        except Exception as e:  # 修复缩进
             logger.error(f"时间同步错误恢复失败: {str(e)}")
             return False
     
@@ -5468,6 +5820,7 @@ class ErrorHandler:
 3. 查看当前策略
 4. 开始抢购
 5. 测试网络模拟运行
+6. 性能测试
 0. 退出
 =====================""")
 
@@ -5475,31 +5828,74 @@ class ErrorHandler:
         """运行主程序"""
         while True:
             self.show_menu()
-            choice = input("请选择操作 (0-5): ").strip()
+            choice = input("请选择操作 (0-6): ").strip()
             
-            if choice == '0':
-                print("程序已退出")
+            if choice == '6':
+                print("""
+=== 性能测试选项 ===
+1. 快速测试 (30秒)
+2. 标准测试 (120秒)
+3. 长时间测试 (300秒)
+4. 自定义时长
+5. 返回主菜单
+===================""")
+                test_choice = input("请选择测试类型 (1-5): ").strip()
+                
+                if test_choice == '1':
+                    duration = 30
+                elif test_choice == '2':
+                    duration = 120
+                elif test_choice == '3':
+                    duration = 300
+                elif test_choice == '4':
+                    duration = int(input("请输入测试时长(秒): "))
+                elif test_choice == '5':
+                    continue
+                else:
+                    print("无效选择")
+                    continue
+                
+                # 创建新的事件循环来执行性能测试
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(sniper.test_current_performance(duration))
+                except Exception as e:
+                    print(f"性能测试失败: {str(e)}")
+                finally:
+                    loop.close()
+            
+            elif choice == '0':
+                print("感谢使用，再见!")
                 break
             elif choice == '1':
-                self.setup_api_keys()
+                sniper.setup_api_keys()
             elif choice == '2':
-                self.setup_strategy()
+                sniper.setup_snipe_strategy()
             elif choice == '3':
-                self.show_current_strategy()
+                sniper.print_strategy()
             elif choice == '4':
-                self.prepare_and_snipe()
-            elif choice == '5':
-                # 测试网络运行
-                self.opening_time = datetime.now(self.timezone) + timedelta(minutes=5)
-                self.trade_client.set_sandbox_mode(True)
-                self.query_client.set_sandbox_mode(True)
+                # 创建新的事件循环来执行异步操作
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
                 try:
-                    self.prepare_and_snipe()
+                    loop.run_until_complete(sniper.prepare_and_snipe())
+                except Exception as e:
+                    print(f"执行抢购失败: {str(e)}")
                 finally:
-                    self.trade_client.set_sandbox_mode(False)
-                    self.query_client.set_sandbox_mode(False)
+                    loop.close()
+            elif choice == '5':
+                # 创建新的事件循环来执行测试
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(test_network())
+                except Exception as e:
+                    print(f"测试网络运行失败: {str(e)}")
+                finally:
+                    loop.close()
             else:
-                print("无效的选择，请重试")
+                print("无效的选择，请重新输入")
 
     async def test_network_run(self):
         """测试网络模拟运行"""
@@ -5654,330 +6050,95 @@ class ErrorHandler:
             self.logger.error(f"IP验证失败: {str(e)}")
             return False
 
-def print_menu(clear=True):
-    """打印主菜单"""
-    print("\n=== 币安现货抢币工具 ===")
-    print("1. 设置API密钥")
-    print("2. 抢开盘策略设置") 
-    print("3. 查看当前策略")
-    print("4. 开始抢购")
-    print("5. 测试网络模拟运行")  # 添加新选项
-    print("0. 退出")
-    print("=====================")
-
-def get_valid_input(prompt: str, input_type: Type = str, allow_empty: bool = False) -> Any:
-    """获取有效输入
-    Args:
-        prompt: 提示信息
-        input_type: 输入类型
-        allow_empty: 是否允许空输入
-    Returns:
-        Any: 转换后的输入值
-    """
-    while True:
+    async def create_ws_connection(self, ip):
+        """创建WebSocket连接"""
         try:
-            value = input(prompt).strip()
-            if allow_empty and not value:
+            # 使用IP绑定的WebSocket连接
+            ws_url = f"wss://stream.binance.com:9443/ws"
+            ws = await websockets.connect(
+                ws_url,
+                extra_headers={
+                    'Host': 'stream.binance.com',
+                    'User-Agent': f'BinanceSniper/1.0 IP/{ip}'
+                },
+                ssl=True,
+                timeout=5
+            )
+            
+            # 订阅行情
+            await ws.send(json.dumps({
+                "method": "SUBSCRIBE",
+                "params": [
+                    "btcusdt@ticker"
+                ],
+                "id": int(time.time() * 1000)
+            }))
+            
+            # 等待订阅确认
+            response = await ws.recv()
+            if json.loads(response).get('result') is None:
+                return ws
+            else:
+                await ws.close()
                 return None
-            if input_type == str:
-                if value:
-                    return value
-                raise ValueError("输入不能为空")
-            return input_type(value)
-        except ValueError:
-            print(f"输入无效，请输入{input_type.__name__}类型的值")
+                
+        except Exception as e:
+            logger.error(f"WebSocket连接失败 (IP: {ip}): {str(e)}")
+            return None
 
-def check_dependencies():
-    """检查依赖"""
-    try:
-        import ccxt
-        logger.info(f"CCXT版本: {ccxt.__version__}")
-        
-        return True
-    except ImportError as e:
-        logger.error(f"依赖检查失败: {str(e)}")
-        logger.error("请运行 setup.sh 安装所需依赖")
-        return False
-
-def setup_snipe_strategy(sniper: BinanceSniper):
-    """抢开盘策略设置"""
-    try:
-        logger.info("开始设置抢购策略...")
-        
-        # 1. 基础设置
-        print("\n>>> 基础参数设置")
-        coin = get_valid_input("请输入要买的币种 (例如 BTC): ", str).upper()
-        symbol = f"{coin}/USDT"  # 自动添加USDT交易对
-        total_usdt = get_valid_input("请输入买入金额(USDT): ", float)
-        
-        # 添加开盘时间设置
-        print("\n>>> 开盘时间设置")
-        print("请输入开盘时间 (东八区/北京时间)")
-        
-        # 先同步时间显示当前时间作为参考
-        server_time = sniper.get_server_time()
-        print(f"\n当前币安服务器时间: {server_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
-        
-        while True:
-            try:
-                # 只做基本的格式验证
-                year = get_valid_input("年 (例如 2025): ", int)
-                if year < 2000 or year > 2100:  # 简单的年份范围检查
-                    print("年份格式无效，请输入2000-2100之间的年份")
-                    continue
-                    
-                month = get_valid_input("月 (1-12): ", int)
-                if month < 1 or month > 12:
-                    print("月份必须在1-12之间")
-                    continue
-                    
-                day = get_valid_input("日 (1-31): ", int)
-                if day < 1 or day > 31:
-                    print("日期必须在1-31之间")
-                    continue
-                    
-                hour = get_valid_input("时 (0-23): ", int)
-                if hour < 0 or hour > 23:
-                    print("小时必须在0-23之间")
-                    continue
-                    
-                minute = get_valid_input("分 (0-59): ", int)
-                if minute < 0 or minute > 59:
-                    print("分钟必须在0-59之间")
-                    continue
-                    
-                second = get_valid_input("秒 (0-59): ", int)
-                if second < 0 or second > 59:
-                    print("秒数必须在0-59之间")
-                    continue
-                
-                # 创建东八区的时间
-                tz = pytz.timezone('Asia/Shanghai')
-                opening_time = tz.localize(datetime(year, month, day, hour, minute, second))
-                
-                # 显示设置的时间信息
-                print(f"\n=== 时间信息 ===")
-                print(f"设置开盘时间: {opening_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
-                print(f"当前服务器时间: {server_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
-                
-                # 确认设置
-                confirm = input("\n确认使用这个开盘时间? (yes/no): ")
-                if confirm.lower() == 'yes':
-                    sniper.opening_time = opening_time
-                    break
-                else:
-                    print("请重新设置开盘时间")
-                    continue
-                
-            except ValueError as e:
-                print(f"时间格式无效，请重新输入: {str(e)}")
-                continue
-        
-        # 设置其他参数...
-        # ... (其他代码保持不变)
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"设置抢购策略失败: {str(e)}")
-        return False
-
-def main():
+# 在文件末尾添加
+async def main():
     """主程序入口"""
     try:
-        # 检查依赖
-        if not check_dependencies():
-            print("依赖检查失败，请安装必要的依赖包")
-            return
-
-        # 初始化配置管理器
+        # 初始化配置和实例
         config = ConfigManager()
+        sniper = BinanceSniper(config)
         
-        # 初始化币安抢币工具 - 只修改这一行
-        sniper = BinanceSniper(config)  # 只传入 config
-
+        # 加载API配置
+        if not sniper.load_api_keys():
+            print("请先配置API密钥")
+            return
+            
+        print("\n=== 币安现货抢币工具 ===")
+        print("1. 设置API密钥")
+        print("2. 抢开盘策略设置")
+        print("3. 查看当前策略")
+        print("4. 开始抢购")
+        print("5. 测试中心")
+        print("0. 退出")
+        print("=====================")
+        
         while True:
-            print_menu()
-            choice = input("请选择操作 (0-5): ").strip()
-
+            choice = input("\n请选择操作 (0-5): ").strip()
+            
             if choice == '0':
                 print("感谢使用，再见!")
                 break
             elif choice == '1':
-                sniper.setup_api_keys()
+                await sniper.setup_api_keys()
             elif choice == '2':
-                sniper.setup_snipe_strategy()
+                await sniper.setup_snipe_strategy()
             elif choice == '3':
                 sniper.print_strategy()
             elif choice == '4':
-                # 创建新的事件循环来执行异步操作
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(sniper.prepare_and_snipe())
-                except Exception as e:
-                    print(f"执行抢购失败: {str(e)}")
-                finally:
-                    loop.close()
-            elif choice == '5':  # 测试网络模拟运行
-                async def test_network():
-                    try:
-                        print("\n=== 开始测试网络模拟运行 ===")
-                        
-                        # 1. 设置测试网环境
-                        print("\n1. 配置测试网环境...")
-                        test_api_key = input("API Key: ").strip()
-                        private_key_path = input("私钥文件路径 (test-prv-key.pem): ").strip()
-                        
-                        # 读取并加载私钥
-                        try:
-                            if not os.path.isfile(private_key_path):
-                                print(f"错误: {private_key_path} 不是有效的文件路径")
-                                return
-                            with open(private_key_path, 'rb') as f:
-                                private_key = load_pem_private_key(
-                                    data=f.read(),
-                                    password=None
-                                )
-                        except Exception as e:
-                            print(f"读取私钥文件失败: {str(e)}")
-                            return
-
-                        async with aiohttp.ClientSession() as session:
-                            # 2. 获取账户余额
-                            print("\n2. 获取账户余额...")
-                            params = {
-                                'timestamp': int(time.time() * 1000)
-                            }
-                            payload = '&'.join([f'{param}={value}' for param, value in params.items()])
-                            signature = base64.b64encode(
-                                private_key.sign(payload.encode('ASCII'))
-                            ).decode('utf-8')
-                            params['signature'] = signature
-                            
-                            headers = {'X-MBX-APIKEY': test_api_key}
-                            async with session.get(
-                                'https://testnet.binance.vision/api/v3/account',
-                                headers=headers,
-                                params=params
-                            ) as response:
-                                account = await response.json()
-                                if 'balances' in account:
-                                    for balance in account['balances']:
-                                        if float(balance['free']) > 0:
-                                            print(f"• {balance['asset']}: {balance['free']}")
-                                
-                            # 3. 获取市场价格
-                            print("\n3. 获取市场价格...")
-                            async with session.get(
-                                'https://testnet.binance.vision/api/v3/ticker/price',
-                                params={'symbol': 'BTCUSDT'}
-                            ) as response:
-                                price_info = await response.json()
-                                current_price = float(price_info['price'])
-                                print(f"• BTC当前价格: {current_price:.2f} USDT")
-                            
-                            # 4. 测试限价买单
-                            print("\n4. 测试限价买单...")
-                            buy_price = float(current_price * 0.99)  # 买单价格略低于市价
-                            buy_quantity = 0.001  # 买入0.001 BTC
-                            
-                            params = {
-                                'symbol': 'BTCUSDT',
-                                'side': 'BUY',
-                                'type': 'LIMIT',
-                                'timeInForce': 'GTC',
-                                'quantity': f'{buy_quantity:.6f}',
-                                'price': f'{buy_price:.2f}',
-                                'timestamp': int(time.time() * 1000)
-                            }
-                            
-                            payload = '&'.join([f'{param}={value}' for param, value in params.items()])
-                            signature = base64.b64encode(
-                                private_key.sign(payload.encode('ASCII'))
-                            ).decode('utf-8')
-                            params['signature'] = signature
-                            
-                            print(f"• 下限价买单: {buy_quantity} BTC @ {buy_price:.2f} USDT")
-                            async with session.post(
-                                'https://testnet.binance.vision/api/v3/order',
-                                headers=headers,
-                                data=params
-                            ) as response:
-                                result = await response.json()
-                                print(f"• 买单结果: {json.dumps(result, indent=2)}")
-                                
-                                if 'orderId' in result:
-                                    buy_order_id = result['orderId']
-                                    
-                                    # 5. 查询订单状态
-                                    print("\n5. 查询订单状态...")
-                                    await asyncio.sleep(2)  # 等待2秒
-                                    
-                                    params = {
-                                        'symbol': 'BTCUSDT',
-                                        'orderId': buy_order_id,
-                                        'timestamp': int(time.time() * 1000)
-                                    }
-                                    payload = '&'.join([f'{param}={value}' for param, value in params.items()])
-                                    signature = base64.b64encode(
-                                        private_key.sign(payload.encode('ASCII'))
-                                    ).decode('utf-8')
-                                    params['signature'] = signature
-                                    
-                                    async with session.get(
-                                        'https://testnet.binance.vision/api/v3/order',
-                                        headers=headers,
-                                        params=params
-                                    ) as response:
-                                        order_status = await response.json()
-                                        print(f"• 订单状态: {json.dumps(order_status, indent=2)}")
-                                    
-                                    # 6. 取消订单
-                                    print("\n6. 取消未成交订单...")
-                                    params = {
-                                        'symbol': 'BTCUSDT',
-                                        'orderId': buy_order_id,
-                                        'timestamp': int(time.time() * 1000)
-                                    }
-                                    payload = '&'.join([f'{param}={value}' for param, value in params.items()])
-                                    signature = base64.b64encode(
-                                        private_key.sign(payload.encode('ASCII'))
-                                    ).decode('utf-8')
-                                    params['signature'] = signature
-                                    
-                                    async with session.delete(
-                                        'https://testnet.binance.vision/api/v3/order',
-                                        headers=headers,
-                                        params=params
-                                    ) as response:
-                                        cancel_result = await response.json()
-                                        print(f"• 取消结果: {json.dumps(cancel_result, indent=2)}")
-                            
-                    except Exception as e:
-                        print(f"\n❌ 测试失败: {str(e)}")
-                        if hasattr(e, 'text'):
-                            print(f"错误详情: {e.text}")
-                    finally:
-                        print("\n=== 测试完成 ===")
-
-                # 创建新的事件循环来执行测试
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                try:
-                    loop.run_until_complete(test_network())
-                except Exception as e:
-                    print(f"测试网络运行失败: {str(e)}")
-                finally:
-                    loop.close()
+                await sniper.prepare_and_snipe()
+            elif choice == '5':
+                # 修改这里,直接使用已有的异步 run_test 方法
+                await sniper.run_test()  # 使用已有的异步测试方法
             else:
                 print("无效的选择，请重新输入")
-                    
-        except KeyboardInterrupt:
+                
+    except KeyboardInterrupt:
         print("\n程序已被用户中断")
     except Exception as e:
         print(f"程序运行出错: {str(e)}")
         logger.error(f"程序运行出错: {str(e)}", exc_info=True)
 
 if __name__ == '__main__':
-    main()
+    # 创建事件循环
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
