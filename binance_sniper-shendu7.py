@@ -1,52 +1,58 @@
-import ccxt
 import time
-from datetime import datetime, timezone, timedelta
 import logging
-import json
-import os
-import threading
-import sys
-from logging.handlers import RotatingFileHandler
-from collections import defaultdict
-import configparser
-from typing import (
-    Tuple, Optional, Dict, List, Any, Set, 
-    Callable, Union, TypeVar, Type
-)
-from types import TracebackType
-from decimal import Decimal
-import websocket
-import requests
-import pytz
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from functools import wraps
-import argparse
-import daemon
-import signal
-import lockfile
-from abc import ABC, abstractmethod
+from logging.handlers import RotatingFileHandler  # 添加这个导入
 import asyncio
-import aiohttp
-import numpy as np
-import numba
+from typing import (
+    Dict, Optional, List, TypeVar, Tuple, Any, Union, Type,
+    Callable, Awaitable, Coroutine, Set, DefaultDict
+)  # 补充完整的 typing 导入
+from types import TracebackType  # 添加 TracebackType 导入
 from concurrent.futures import ThreadPoolExecutor
-from cachetools import TTLCache
-import mmap
-import io
-import prometheus_client as prom
-import websockets
-import psutil
-import socket
-import gc
-import struct
 import statistics
-import glob
-import base64  # 使用Python内置的base64模块
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import ed25519
+import ccxt
+import aiohttp
+from aiohttp import ClientSession, ClientTimeout, TCPConnector
+import prometheus_client as prom
+from collections import defaultdict, deque
+import psutil
+import pytz
+from datetime import datetime, timedelta, timezone  # 补充 timedelta 和 timezone
+import sys
+import os
+import json  # 添加 json 模块导入
+import configparser  # 添加 configparser 模块导入
+import base64  # 添加 base64 模块导入
+from functools import wraps, partial  # 添加装饰器支持
+import requests
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException, Timeout
+from urllib3.util.retry import Retry  # 添加 Retry
+import websocket  # 添加 websocket 支持
+import threading  # 添加 threading 支持
+from threading import Lock, Event
+from cryptography.hazmat.primitives.serialization import load_pem_private_key  # 添加加密支持
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives.serialization import load_pem_private_key  # 添加这行
+from decimal import Decimal  # 用于精确计算
+import uuid  # 用于生成唯一ID
+import signal  # 用于信号处理
+import gc  # 用于垃圾回收控制
+import contextlib  # 用于上下文管理
+import weakref  # 用于弱引用
+import inspect  # 用于运行时检查
+import socket
+import subprocess
+import netifaces
+
+# 获取当前脚本所在目录
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# 设置相对于脚本目录的路径
+LOG_DIR = os.path.join(SCRIPT_DIR, 'logs')
+CONFIG_DIR = os.path.join(SCRIPT_DIR, 'config')
+
+# 确保目录存在
+os.makedirs(LOG_DIR, exist_ok=True)
+os.makedirs(CONFIG_DIR, exist_ok=True)
 
 # 统一异常处理
 class SniperError(Exception):
@@ -74,19 +80,14 @@ class TimeError(SniperError):
     pass
 
 class PreciseWaiter:
-    """精确等待器，用于高精度时间控制"""
-    
+    """精确等待器"""
     def __init__(self):
-        """初始化等待器"""
-        self.last_sleep_error = 0  # 记录上次休眠误差
-        self._min_sleep = 0.000001  # 最小休眠时间(1微秒)
+        self.last_sleep_error = 0
+        self._min_sleep = 0.000001
+        self.logger = logging.getLogger(__name__)
         
     async def wait_until(self, target_time: float):
-        """等待到指定时间
-        
-        Args:
-            target_time: 目标时间戳(毫秒)
-        """
+        """等待到指定时间"""
         while True:
             current = time.time() * 1000
             if current >= target_time:
@@ -94,19 +95,13 @@ class PreciseWaiter:
                 
             remaining = target_time - current
             if remaining > 1:
-                # 长等待使用asyncio.sleep
-                await asyncio.sleep(remaining / 2000)  # 转换为秒并减半
+                await asyncio.sleep(remaining / 2000)
             else:
-                # 短等待使用自旋等待
                 while time.time() * 1000 < target_time:
-                    await asyncio.sleep(0)  # 让出CPU时间片
+                    await asyncio.sleep(0)
     
     async def sleep(self, duration: float):
-        """精确休眠指定时间
-        
-        Args:
-            duration: 休眠时间(毫秒)
-        """
+        """精确休眠指定时间"""
         if duration <= 0:
             return
             
@@ -121,6 +116,414 @@ class PreciseWaiter:
         """
         while time.time() * 1000 < target_time:
             pass
+
+# 在 SniperError 相关类之后，PreciseWaiter 类之前添加 IPManager 类
+class IPManager:
+    """IP管理器 - 处理多IP轮换、监控和故障切换"""
+    def __init__(self, logger=None):
+        self.logger = logger or logging.getLogger(__name__)
+        self.interface = self._get_default_interface()
+        self.ips = self._get_interface_ips()
+        self.ip_stats = {}
+        for ip in self.ips:
+            self.ip_stats[ip] = {
+                "requests": 0,          # 请求计数
+                "errors": 0,            # 错误计数
+                "last_used": 0,         # 最后使用时间
+                "latency": float('inf'), # 当前延迟
+                "ws_connected": False,   # WebSocket连接状态
+                "last_ws_msg": 0,       # 最后WS消息时间
+                "window_start": 0,      # 时间窗口开始
+                "window_end": 0         # 时间窗口结束
+            }
+        
+        # 为每个IP分配时间窗口
+        for i, ip in enumerate(self.ips):
+            window_start = i * 20  # 0, 20, 40
+            window_end = window_start + 20  # 20, 40, 60
+            self.ip_stats[ip]['window_start'] = window_start
+            self.ip_stats[ip]['window_end'] = window_end
+
+        self.current_ip_index = 0
+        self.latency_threshold = 1000  # 延迟阈值(ms)
+        self.error_threshold = 5       # 错误阈值
+        self.lock = asyncio.Lock()     # 用于并发控制
+        self.scheduler = RequestScheduler()  # 请求调度器
+
+    def _get_default_interface(self) -> str:
+        """获取默认网络接口"""
+        try:
+            gateways = netifaces.gateways()
+            default = gateways.get('default', {}).get(netifaces.AF_INET)
+            if default:
+                return default[1]
+            for iface in netifaces.interfaces():
+                if iface != 'lo':
+                    return iface
+        except Exception as e:
+            self.logger.error(f"获取网络接口失败: {e}")
+        return "eth0"
+
+    def _get_interface_ips(self) -> List[str]:
+        """获取接口上配置的所有IPv4地址"""
+        ips = []
+        try:
+            addrs = netifaces.ifaddresses(self.interface)
+            if netifaces.AF_INET in addrs:
+                for addr in addrs[netifaces.AF_INET]:
+                    if 'addr' in addr and addr['addr'] != '127.0.0.1':
+                        ips.append(addr['addr'])
+            self.logger.info(f"检测到IP地址: {ips}")
+        except Exception as e:
+            self.logger.error(f"获取IP地址失败: {e}")
+        return ips
+
+    async def get_best_ip(self) -> str:
+        """获取当前最佳IP"""
+        current_ms = int(time.time() * 1000) % 60
+        return await self.get_ip_for_window(current_ms)
+
+    async def report_error(self, ip: str):
+        """报告IP错误"""
+        await self.update_ip_status(ip, float('inf'), error=True)
+
+    async def get_ip_for_window(self, current_ms: int) -> str:
+        """获取当前时间窗口的最佳IP"""
+        async with self.lock:
+            for ip in self.ips:
+                stats = self.ip_stats[ip]
+                if (stats['window_start'] <= current_ms < stats['window_end'] and 
+                    stats['errors'] < self.error_threshold):
+                    return ip
+            # 如果没有合适的IP，返回延迟最低的
+            return min(self.ips, key=lambda x: self.ip_stats[x]['latency'])
+
+    async def update_ip_status(self, ip: str, latency: float, error: bool = False):
+        """更新IP状态"""
+        async with self.lock:
+            stats = self.ip_stats[ip]
+            stats['latency'] = latency
+            stats['last_used'] = time.time()
+            if error:
+                stats['errors'] += 1
+                if stats['errors'] >= self.error_threshold:
+                    self.logger.warning(f"IP {ip} 错误次数过多，将被临时禁用")
+
+class RequestScheduler:
+    """请求调度器 - 实现精确的时间窗口和请求控制"""
+    def __init__(self):
+        self.last_request_time = {}
+        
+        # 优化请求间隔
+        self.request_intervals = {
+            'depth': 5,      # 降低到5ms (原来10ms)
+            'price': 7,      # 降低到7ms (原来15ms)
+            'book': 3        # 保持3ms
+        }
+        
+        # 优化时间窗口，缩小窗口提高并发
+        self.request_windows = {
+            'ip1': (0, 15),     # 0-15ms窗口  (原来0-20ms)
+            'ip2': (15, 30),    # 15-30ms窗口 (原来20-40ms)
+            'ip3': (30, 45)     # 30-45ms窗口 (原来40-60ms)
+        }
+        
+        # 增加配额限制，避免触发币安限制
+        self.request_quotas = {
+            'ip1': {
+                'used': 0,
+                'limit': 1100,  # 留100个请求的安全边际
+                'depth_count': 0,
+                'price_count': 0,
+                'book_count': 0,
+                'last_reset': time.time()
+            },
+            'ip2': {
+                'used': 0,
+                'limit': 1100,
+                'depth_count': 0,
+                'price_count': 0,
+                'book_count': 0,
+                'last_reset': time.time()
+            },
+            'ip3': {
+                'used': 0,
+                'limit': 1100,
+                'depth_count': 0,
+                'price_count': 0,
+                'book_count': 0,
+                'last_reset': time.time()
+            }
+        }
+        
+        self.lock = asyncio.Lock()
+        self.last_reset_time = time.time()
+        
+        # 添加高频模式标志
+        self.high_freq_mode = False
+        self.high_freq_start_time = 0
+        self.HIGH_FREQ_DURATION = 10  # 高频模式持续10秒
+
+    async def enable_high_freq_mode(self):
+        """启用高频模式 - 用于开盘前后的关键时期"""
+        self.high_freq_mode = True
+        self.high_freq_start_time = time.time()
+        
+        # 临时调整请求间隔
+        self.request_intervals = {
+            'depth': 3,    # 极限3ms
+            'price': 4,    # 极限4ms
+            'book': 3      # 保持3ms
+        }
+        
+        self.logger.info("已启用高频模式")
+
+    async def disable_high_freq_mode(self):
+        """禁用高频模式 - 恢复正常请求频率"""
+        self.high_freq_mode = False
+        
+        # 恢复正常请求间隔
+        self.request_intervals = {
+            'depth': 5,    # 正常5ms
+            'price': 7,    # 正常7ms
+            'book': 3      # 保持3ms
+        }
+        
+        self.logger.info("已恢复正常模式")
+
+    async def can_make_request(self, ip: str, request_type: str) -> bool:
+        """检查是否可以发送请求"""
+        async with self.lock:
+            # 检查是否需要退出高频模式
+            if (self.high_freq_mode and 
+                time.time() - self.high_freq_start_time > self.HIGH_FREQ_DURATION):
+                await self.disable_high_freq_mode()
+            
+            # 检查配额
+            quota = self.request_quotas[ip]
+            if quota['used'] >= quota['limit']:
+                return False
+            
+            # 获取当前毫秒时间
+            current_ms = int(time.time() * 1000) % 45  # 改为45ms循环
+            window_start, window_end = self.request_windows[ip]
+            
+            # 检查是否在时间窗口内
+            if not (window_start <= current_ms < window_end):
+                return False
+            
+            # 检查请求间隔
+            last_time = self.last_request_time.get(f"{ip}_{request_type}", 0)
+            interval = self.request_intervals[request_type]
+            
+            if (time.time() * 1000 - last_time) < interval:
+                return False
+                
+            return True
+
+    async def track_request(self, ip: str, request_type: str):
+        """记录请求"""
+        async with self.lock:
+            # 更新请求计数
+            self.request_quotas[ip]['used'] += 1
+            self.request_quotas[ip][f'{request_type}_count'] += 1
+            self.last_request_time[f"{ip}_{request_type}"] = time.time() * 1000
+            
+            # 检查是否需要重置计数器
+            current_time = time.time()
+            if current_time - self.last_reset_time >= 60:
+                await self.reset_quotas()
+
+    async def reset_quotas(self):
+        """重置请求配额"""
+        async with self.lock:
+            for ip in self.request_quotas:
+                self.request_quotas[ip] = {
+                    'used': 0,
+                    'limit': 1100,
+                    'depth_count': 0,
+                    'price_count': 0,
+                    'book_count': 0
+                }
+            self.last_reset_time = time.time()
+
+    async def get_quota_status(self, ip: str) -> dict:
+        """获取配额状态"""
+        async with self.lock:
+            return {
+                'total_used': self.request_quotas[ip]['used'],
+                'remaining': self.request_quotas[ip]['limit'] - self.request_quotas[ip]['used'],
+                'depth_requests': self.request_quotas[ip]['depth_count'],
+                'price_requests': self.request_quotas[ip]['price_count'],
+                'book_requests': self.request_quotas[ip]['book_count']
+            }
+
+class BinanceWebSocketManager:
+    """优化后的WebSocket管理器"""
+    def __init__(self, symbol: str, logger=None):
+        self.symbol = symbol.lower()
+        self.logger = logger or logging.getLogger(__name__)
+        self.connections = {}
+        self.data_callbacks = []
+        self.running = True
+        self.lock = asyncio.Lock()
+        self.last_data = {}
+        self.scheduler = RequestScheduler()
+        self.latency_stats = {}
+        self.LATENCY_WINDOW = 1000  # 保留1000个延迟样本
+
+    async def add_connection(self, ip: str):
+        """为指定IP添加WebSocket连接"""
+        try:
+            streams = [
+                f"{self.symbol}@bookTicker",
+                f"{self.symbol}@depth@100ms"
+            ]
+            url = f"wss://stream.binance.com:9443/ws/{'/'.join(streams)}"
+            
+            self.connections[ip] = {
+                'ws': await websocket.connect(url, source_address=(ip, 0)),
+                'last_msg': time.time(),
+                'active': True,
+                'latency': deque(maxlen=self.LATENCY_WINDOW)
+            }
+            
+            asyncio.create_task(self._handle_messages(ip))
+            asyncio.create_task(self._monitor_connection(ip))
+            
+            self.logger.info(f"WebSocket连接已建立 (IP: {ip})")
+            
+        except Exception as e:
+            self.logger.error(f"WebSocket连接失败 (IP: {ip}): {e}")
+            raise
+
+    async def _handle_messages(self, ip: str):
+        """处理WebSocket消息"""
+        ws_conn = self.connections[ip]
+        
+        while self.running and ws_conn['active']:
+            try:
+                message = await ws_conn['ws'].recv()
+                data = json.loads(message)
+                
+                receive_time = time.time()
+                event_time = data.get('E', 0) / 1000
+                latency = receive_time - event_time
+                
+                ws_conn['latency'].append(latency)
+                
+                async with self.lock:
+                    if data.get('e') == 'bookTicker':
+                        self.last_data['bookTicker'] = {
+                            'data': data,
+                            'timestamp': receive_time,
+                            'latency': latency,
+                            'ip': ip
+                        }
+                    elif 'depthUpdate' in message:
+                        self.last_data['depth'] = {
+                            'data': data,
+                            'timestamp': receive_time,
+                            'latency': latency,
+                            'ip': ip
+                        }
+                        
+                for callback in self.data_callbacks:
+                    await callback(data, ip, latency)
+                    
+                ws_conn['last_msg'] = receive_time
+                
+            except Exception as e:
+                self.logger.error(f"WebSocket消息处理错误 (IP: {ip}): {e}")
+                ws_conn['active'] = False
+                break
+
+    async def _monitor_connection(self, ip: str):
+        """监控连接状态"""
+        while self.running:
+            try:
+                conn = self.connections.get(ip)
+                if not conn:
+                    break
+                    
+                current_time = time.time()
+                if current_time - conn['last_msg'] > 30:
+                    self.logger.warning(f"WebSocket连接超时 (IP: {ip})")
+                    conn['active'] = False
+                    await self._attempt_reconnect(ip)
+                    
+                if conn['latency']:
+                    avg_latency = sum(conn['latency'])/len(conn['latency'])
+                    if avg_latency > 1000:
+                        self.logger.warning(f"WebSocket延迟过高 (IP: {ip}): {avg_latency:.2f}ms")
+                        
+                await asyncio.sleep(0.001)
+                
+            except Exception as e:
+                self.logger.error(f"连接监控错误 (IP: {ip}): {e}")
+                await asyncio.sleep(0.001)
+
+    async def get_best_connection(self) -> Optional[str]:
+        """获取最佳连接"""
+        best_ip = None
+        min_latency = float('inf')
+        
+        async with self.lock:
+            for ip, conn in self.connections.items():
+                if not conn['active'] or not conn['latency']:
+                    continue
+                    
+                avg_latency = sum(conn['latency'])/len(conn['latency'])
+                if avg_latency < min_latency:
+                    min_latency = avg_latency
+                    best_ip = ip
+                    
+        return best_ip
+
+    async def add_callback(self, callback: Callable):
+        """添加数据处理回调"""
+        if callback not in self.data_callbacks:
+            self.data_callbacks.append(callback)
+
+    async def remove_callback(self, callback: Callable):
+        """移除数据处理回调"""
+        if callback in self.data_callbacks:
+            self.data_callbacks.remove(callback)
+
+    async def close_connection(self, ip: str):
+        """关闭指定IP的连接"""
+        if ip in self.connections:
+            try:
+                conn = self.connections[ip]
+                conn['active'] = False
+                await conn['ws'].close()
+                del self.connections[ip]
+            except Exception as e:
+                self.logger.error(f"关闭WebSocket连接失败 (IP: {ip}): {e}")
+
+    async def close(self):
+        """关闭所有连接"""
+        self.running = False
+        tasks = []
+        for ip in list(self.connections.keys()):
+            tasks.append(self.close_connection(ip))
+        if tasks:
+            await asyncio.gather(*tasks)
+        self.connections.clear()
+        self.data_callbacks.clear()
+        self.last_data.clear()
+
+    async def _attempt_reconnect(self, ip: str):
+        """尝试重新连接"""
+        try:
+            self.logger.info(f"尝试重新连接 WebSocket (IP: {ip})")
+            await self.close_connection(ip)
+            await asyncio.sleep(1)  # 等待1秒
+            await self.add_connection(ip)
+            return True
+        except Exception as e:
+            self.logger.error(f"WebSocket重连失败 (IP: {ip}): {e}")
+            return False
 
 def setup_logger():
     """配置日志系统"""
@@ -144,7 +547,7 @@ def setup_logger():
     console_handler.setFormatter(formatter)
     
     # 文件处理器 (按大小轮转)
-    log_file = 'logs/binance_sniper.log'
+    log_file = os.path.join(LOG_DIR, 'binance_sniper.log')
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     file_handler = RotatingFileHandler(
         log_file,
@@ -226,244 +629,272 @@ class ExecutionStrategyManager:
 class TimeSync:
     """时间同步管理器"""
     def __init__(self):
-        self.network_latency = None  # 网络延迟
-        self.time_offset = None      # 时间偏移
-        self.last_sync_time = 0      # 上次同步时间
-        self.sync_interval = 60      # 同步间隔(秒)
-        self.min_samples = 5         # 最小样本数
-        self.max_samples = 10        # 最大样本数
-        self.sync_timeout = 5        # 同步超时时间(秒)
+        self.network_latency = None
+        self.time_offset = None
+        self.last_sync_time = 0
+        self.sync_interval = 30  # 改为30秒同步一次
+        self.min_samples = 5
+        self.max_samples = 10
+        self._server_time = 0  # 添加服务器时间缓存
         
-    async def sync(self, client) -> bool:
-        """同步时间
-        Args:
-            client: API客户端
-        Returns:
-            bool: 同步是否成功
-        """
+    async def get_server_time(self) -> int:
+        """获取币安服务器时间"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get('https://api.binance.com/api/v3/time', timeout=2) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result['serverTime']  # 毫秒时间戳
+        except Exception as e:
+            logger.error(f"获取服务器时间失败: {str(e)}")
+            return None
+
+    async def sync(self) -> bool:
+        """同步时间"""
         try:
             measurements = []
             
             # 收集多个样本
             for _ in range(self.max_samples):
                 start = time.perf_counter_ns()
-                server_time = await client.fetch_time()
+                server_time = await self.get_server_time()
+                if not server_time:
+                    continue
+                    
                 end = time.perf_counter_ns()
                 
                 rtt = (end - start) / 1e6  # 转换为毫秒
                 latency = rtt / 2
-                offset = server_time - (start/1e6 + latency)
                 
                 measurements.append({
+                    'server_time': server_time,
                     'latency': latency,
-                    'offset': offset,
                     'rtt': rtt
                 })
                 
-                await asyncio.sleep(0.1)  # 间隔100ms
+                await asyncio.sleep(0.1)
             
             # 过滤异常值
             filtered = self._filter_outliers(measurements)
             if len(filtered) < self.min_samples:
-                logger.error("有效样本数不足")
                 return False
-            
-            # 使用中位数作为最终值
+                
+            # 使用中位数
             self.network_latency = statistics.median(m['latency'] for m in filtered)
-            self.time_offset = statistics.median(m['offset'] for m in filtered)
-            self.last_sync_time = time.time()
+            self._server_time = statistics.median(m['server_time'] for m in filtered)
+            self.last_sync_time = self._server_time
             
+            # 修改日志输出，使用本地时间
             logger.info(f"""
-=== 时间同步完成 ===
-网络延迟: {self.network_latency:.2f}ms
-时间偏移: {self.time_offset:.2f}ms
-样本数量: {len(filtered)}
+[时间同步] 
+• 本地时间: {format_local_time(self._server_time)}
+• 网络延迟: {self.network_latency:.2f}ms
+• 样本数量: {len(filtered)}
 """)
+            
             return True
             
         except Exception as e:
             logger.error(f"时间同步失败: {str(e)}")
             return False
     
-    def _filter_outliers(self, measurements: List[Dict]) -> List[Dict]:
-        """过滤异常值"""
-        if len(measurements) < 4:
-            return measurements
-            
-        # 计算RTT的四分位数
-        rtts = sorted(m['rtt'] for m in measurements)
-        q1 = rtts[len(rtts)//4]
-        q3 = rtts[3*len(rtts)//4]
-        iqr = q3 - q1
-        
-        # 过滤掉RTT异常的样本
-        return [m for m in measurements if q1 - 1.5*iqr <= m['rtt'] <= q3 + 1.5*iqr]
+    def get_current_time(self) -> int:
+        """获取当前服务器时间(毫秒)"""
+        if not self._server_time:
+            return 0
+        # 基于最后同步的服务器时间计算当前时间
+        elapsed = time.perf_counter_ns() / 1e6  # 转换为毫秒
+        return int(self._server_time + elapsed)
     
     def needs_sync(self) -> bool:
         """检查是否需要同步"""
+        current = self.get_current_time()
         return (
-            self.network_latency is None or
-            self.time_offset is None or
-            time.time() - self.last_sync_time > self.sync_interval
+            self._server_time == 0 or
+            current - self.last_sync_time > self.sync_interval * 1000  # 转换为毫秒
         )
-    
-    def get_network_latency(self) -> Optional[float]:
-        """获取网络延迟"""
-        return self.network_latency
-    
-    def get_time_offset(self) -> Optional[float]:
-        """获取时间偏移"""
-        return self.time_offset
 
 class MarketDepthAnalyzer:
     """市场深度分析器"""
-    
-    def __init__(self, client):
-        self.client = client
-        self.logger = logging.getLogger(self.__class__.__name__)
+    def __init__(self):
+        self.session = None
+        self.base_url = 'https://api.binance.com'
+        self.depth_path = '/api/v3/depth'
+        self._cached_params = {}
+        self._connector = None
         
-    async def analyze_depth(self, client, symbol: str, limit: int = 20) -> Optional[Dict]:
-        """分析市场深度
-        
-        Args:
-            client: API客户端
-            symbol: 交易对
-            limit: 深度档数
+    async def _init_session(self):
+        """初始化会话，优化连接设置"""
+        if self.session is None:
+            # 1. 优化连接设置
+            self._connector = aiohttp.TCPConnector(
+                force_close=False,  # 改为保持连接
+                ttl_dns_cache=300,  # DNS缓存5分钟
+                use_dns_cache=True,
+                limit=1,  # 限制并发连接数为1
+                enable_cleanup_closed=True,  # 自动清理关闭的连接
+                tcp_nodelay=True,  # 启用 TCP_NODELAY
+                keepalive_timeout=30  # 连接保持30秒
+            )
             
-        Returns:
-            Optional[Dict]: 深度分析结果
-        """
-        try:
-            # 获取订单簿数据
-            orderbook = await client.fetch_order_book(symbol, limit)
-            if not orderbook or not orderbook['asks']:
-                return None
-                
-            asks = orderbook['asks']
-            bids = orderbook['bids']
+            # 2. 优化超时设置
+            timeout = aiohttp.ClientTimeout(
+                total=0.5,      # 总超时500ms
+                connect=0.1,    # 连接超时100ms
+                sock_read=0.2   # 读取超时200ms
+            )
             
-            # 基本价格信息
-            best_ask = asks[0][0]
-            best_bid = bids[0][0] if bids else 0
-            spread = best_ask - best_bid
+            # 3. 创建会话
+            self.session = aiohttp.ClientSession(
+                connector=self._connector,
+                timeout=timeout,
+                headers={
+                    'Accept': 'application/json',
+                    'User-Agent': 'aiohttp/3.8.1',
+                    'Connection': 'keep-alive'
+                }
+            )
             
-            # 深度统计
-            ask_volume = sum(ask[1] for ask in asks[:5])  # 前5档卖单量
-            bid_volume = sum(bid[1] for bid in bids[:5])  # 前5档买单量
-            
-            # 检查深度异常
-            price_gaps = [asks[i+1][0] - asks[i][0] for i in range(min(4, len(asks)-1))]
-            max_gap = max(price_gaps) if price_gaps else 0
-            avg_gap = sum(price_gaps) / len(price_gaps) if price_gaps else 0
-            
-            return {
-                'ask': best_ask,
-                'bid': best_bid,
-                'spread': spread,
-                'spread_ratio': spread / best_bid if best_bid else 0,
-                'ask_volume': ask_volume,
-                'bid_volume': bid_volume,
-                'max_gap': max_gap,
-                'avg_gap': avg_gap,
-                'timestamp': orderbook['timestamp'],
-                'asks': asks[:5],  # 前5档卖单
-                'bids': bids[:5]   # 前5档买单
+    def _prepare_params(self, symbol: str, limit: int = 5):
+        """预处理请求参数"""
+        cache_key = f"{symbol}:{limit}"
+        if cache_key not in self._cached_params:
+            self._cached_params[cache_key] = {
+                'symbol': symbol.replace('/', ''),
+                'limit': limit
             }
+        return self._cached_params[cache_key]
+
+    async def analyze_depth(self, client, symbol: str, limit: int = 5):
+        """分析市场深度"""
+        try:
+            await self._init_session()
+            params = self._prepare_params(symbol, limit)
             
+            # 4. 优化请求
+            async with self.session.get(
+                f"{self.base_url}{self.depth_path}",
+                params=params,
+                skip_auto_headers={'Accept-Encoding'},  # 跳过自动添加的头
+                ssl=False,  # 禁用SSL验证
+                allow_redirects=False  # 禁用重定向
+            ) as response:
+                if response.status != 200:
+                    raise MarketError(f"获取深度数据失败: {response.status}")
+                
+                # 5. 优化数据处理
+                orderbook = await response.json(content_type=None)  # 跳过content-type检查
+                
+                if not orderbook or 'asks' not in orderbook:
+                    return None
+                
+                # 6. 使用列表推导优化数据处理
+                asks = [[float(p), float(q)] for p, q in orderbook['asks'][:5]]
+                bids = [[float(p), float(q)] for p, q in orderbook['bids'][:5]]
+                
+                best_ask = asks[0][0]
+                best_bid = bids[0][0] if bids else 0
+                
+                # 7. 使用sum+generator优化计算
+                ask_volume = sum(ask[1] for ask in asks)
+                bid_volume = sum(bid[1] for bid in bids)
+                
+                # 8. 优化价格差计算
+                price_gaps = [asks[i+1][0] - asks[i][0] for i in range(len(asks)-1)]
+                max_gap = max(price_gaps, default=0)
+                avg_gap = sum(price_gaps) / len(price_gaps) if price_gaps else 0
+                
+                return {
+                    'ask': best_ask,
+                    'bid': best_bid,
+                    'spread': best_ask - best_bid,
+                    'spread_ratio': (best_ask - best_bid) / best_bid if best_bid else 0,
+                    'ask_volume': ask_volume,
+                    'bid_volume': bid_volume,
+                    'max_gap': max_gap,
+                    'avg_gap': avg_gap,
+                    'timestamp': orderbook.get('T', int(time.time() * 1000))
+                }
+                
         except Exception as e:
-            self.logger.error(f"分析市场深度失败: {str(e)}")
+            logger.error(f"分析市场深度失败: {str(e)}")
             return None
-    
-    def is_depth_normal(self, depth_data: Dict) -> bool:
-        """检查深度是否正常
-        
-        Args:
-            depth_data: 深度数据
             
-        Returns:
-            bool: 深度是否正常
-        """
+    async def close(self):
+        """关闭资源"""
+        if self.session:
+            await self.session.close()
+            self.session = None
+        if self._connector:
+            await self._connector.close()
+            self._connector = None
+
+    def is_depth_normal(self, depth_data: Dict) -> bool:
+        """检查深度是否正常"""
         if not depth_data:
             return False
             
         try:
-            # 1. 检查买卖价差
-            if depth_data['spread_ratio'] > 0.05:  # 价差超过5%
-                self.logger.warning(f"价差过大: {depth_data['spread_ratio']*100:.2f}%")
+            if depth_data['spread_ratio'] > 0.05:
+                logger.warning(f"价差过大: {depth_data['spread_ratio']*100:.2f}%")
                 return False
                 
-            # 2. 检查深度断层
             if depth_data['max_gap'] > depth_data['avg_gap'] * 3:
-                self.logger.warning("检测到深度断层")
+                logger.warning("检测到深度断层")
                 return False
                 
-            # 3. 检查深度充足性
-            min_volume = 10  # 最小深度要求
+            min_volume = 10
             if depth_data['ask_volume'] < min_volume:
-                self.logger.warning(f"卖单深度不足: {depth_data['ask_volume']:.2f}")
+                logger.warning(f"卖单深度不足: {depth_data['ask_volume']:.2f}")
                 return False
                 
             return True
             
         except Exception as e:
-            self.logger.error(f"深度检查失败: {str(e)}")
+            logger.error(f"深度检查失败: {str(e)}")
             return False
 
 class OrderExecutor:
     """订单执行器"""
-    
     def __init__(self):
-        self.logger = logging.getLogger(self.__class__.__name__)
+        self.logger = logging.getLogger(__name__)
         self._order_buffer = bytearray(1024 * 10)  # 10KB缓冲区
+        self._executor = ThreadPoolExecutor(max_workers=4)
         
-    async def execute_orders(self, 
+    async def execute_orders(self,
                            client,
                            symbol: str,
                            amount: float,
                            price: float,
                            concurrent_orders: int = 3) -> Optional[Dict]:
-        """执行订单
-        
-        Args:
-            client: API客户端
-            symbol: 交易对
-            amount: 数量
-            price: 价格
-            concurrent_orders: 并发订单数
-            
-        Returns:
-            Optional[Dict]: 成功的订单信息
-        """
+        """执行订单"""
         try:
-            # 1. 准备订单参数
+            # 基础参数
             base_params = {
-                'symbol': symbol.replace('/', ''),
+                'symbol': symbol,
                 'side': 'BUY',
                 'type': 'LIMIT',
                 'timeInForce': 'IOC',
-                'quantity': amount,
+                'quantity': amount / concurrent_orders,
                 'price': price
             }
             
-            # 2. 创建多个订单任务
-            order_tasks = []
+            # 创建并发任务
+            tasks = []
             for _ in range(concurrent_orders):
-                params = base_params.copy()
-                params['timestamp'] = int(time.time() * 1000)
-                task = self._execute_single_order(client, params)
-                order_tasks.append(task)
+                task = self._execute_single_order(client, base_params.copy())
+                tasks.append(task)
+                
+            # 等待所有任务完成
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            # 3. 并发执行订单
-            orders = await asyncio.gather(*order_tasks, return_exceptions=True)
-            
-            # 4. 处理结果
-            success_order = None
-            for order in orders:
-                if isinstance(order, dict) and order.get('status') == 'FILLED':
-                    success_order = order
-                    break
-            
-            return success_order
+            # 处理结果
+            successful_orders = []
+            for result in results:
+                if isinstance(result, dict) and result.get('status') == 'closed':
+                    successful_orders.append(result)
+                    
+            return successful_orders[0] if successful_orders else None
             
         except Exception as e:
             self.logger.error(f"订单执行失败: {str(e)}")
@@ -472,293 +903,18 @@ class OrderExecutor:
     async def _execute_single_order(self, client, params: Dict) -> Optional[Dict]:
         """执行单个订单"""
         try:
-            return await client.create_order(**params)
+            # 使用线程池执行同步API调用
+            return await asyncio.get_event_loop().run_in_executor(
+                self._executor,
+                client.create_order,
+                **params
+            )
         except Exception as e:
             self.logger.error(f"执行订单失败: {str(e)}")
             return None
 
-# 执行流程控制器
-class ExecutionController:
-    def __init__(self, 
-                 time_sync: TimeSync,
-                 order_executor: 'OrderExecutor',
-                 depth_analyzer: 'MarketDepthAnalyzer',
-                 monitor: 'RealTimeMonitor'):
-        self.time_sync = time_sync
-        self.order_executor = order_executor
-        self.depth_analyzer = depth_analyzer
-        self.monitor = monitor
-        self.waiter = PreciseWaiter()
-        self.market_cache = None
-        
-    async def execute_snipe(self,
-                          client,
-                          symbol: str,
-                          amount: float,
-                          target_time: float,
-                          price: Optional[float] = None,
-                          concurrent_orders: int = 3) -> Optional[Dict]:
-        """执行抢购"""
-        try:
-            # 初始化市场数据缓存
-            self.market_cache = MarketDataCache(client)
-            await self.market_cache.start(symbol)
-            
-            print("\n=== 开始执行抢购任务 ===")
-            print(f"交易对: {symbol}")
-            print(f"买入金额: {format_number(amount)} USDT")
-            print(f"开盘时间: {datetime.fromtimestamp(target_time/1000).strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
-            
-            current_time = time.time() * 1000
-            hours_remaining = (target_time - current_time) / (1000 * 3600)
-            print(f"距离开盘: {hours_remaining:.1f}小时\n")
-
-            # 系统检查
-            print("[系统检查]")
-            balance = await client.fetch_balance()
-            usdt_balance = balance.get('USDT', {}).get('free', 0)
-            print(f"✓ API连接正常")
-            print(f"✓ 账户余额充足: {format_number(usdt_balance)} USDT")
-            print(f"✓ 交易权限正常")
-            print(f"✓ 市场状态正常: 等待开盘\n")
-
-            # 网络预热
-            print("[网络预热] - 持续5分钟")
-            test_results = []
-            test_start = time.time()
-            while time.time() - test_start < 300:  # 5分钟预热
-                network_stats = await self._measure_network_stats(client)
-                if network_stats:
-                    test_results.append(network_stats)
-                    print(f"• 测试组{len(test_results)}: 延迟 {network_stats['latency']:.1f}ms (波动: ±{network_stats['jitter']:.1f}ms) 偏移: {network_stats['offset']:.1f}ms")
-                await asyncio.sleep(5)
-
-            if test_results:
-                avg_latency = statistics.mean(r['latency'] for r in test_results)
-                avg_jitter = statistics.mean(r['jitter'] for r in test_results)
-                avg_offset = statistics.mean(r['offset'] for r in test_results)
-                print(f"\n>>> 网络状态: {'优秀' if avg_latency < 20 else '良好' if avg_latency < 50 else '一般'}")
-                print(f"    平均延迟: {avg_latency:.1f}ms")
-                print(f"    波动范围: ±{avg_jitter:.1f}ms")
-                print(f"    时间偏移: {avg_offset:.1f}ms\n")
-
-            # 等待开盘
-            print("[等待开盘]")
-            while True:
-                current = time.time() * 1000
-                remaining = target_time - current
-                if remaining <= 0:
-                    break
-                    
-                hours = int(remaining / (1000 * 3600))
-                minutes = int((remaining % (1000 * 3600)) / (1000 * 60))
-                seconds = int((remaining % (1000 * 60)) / 1000)
-                print(f"\r距离开盘还有: {hours:02d}:{minutes:02d}:{seconds:02d}", end='', flush=True)
-                
-                if remaining <= 300000:  # 最后5分钟
-                    print("\n\n>>> 进入最后5分钟准备阶段 <<<")
-                    break
-                    
-                await asyncio.sleep(1)
-
-            # 最终网络状态检测
-            print("\n[最终网络状态]")
-            final_stats = await self._measure_network_stats(client)
-            if final_stats:
-                print(f"• 延迟: {final_stats['latency']:.1f}ms")
-                print(f"• 波动: ±{final_stats['jitter']:.1f}ms")
-                print(f"• 偏移: {final_stats['offset']:.1f}ms")
-                print(f"• 评估: 网络状态{'稳定' if final_stats['latency'] < 30 else '一般'}, {'适合' if final_stats['latency'] < 50 else '不适合'}抢购\n")
-
-            # 执行抢购
-            print("[执行抢购]")
-            print("• T-100ms: 开始执行")
-            print("• T-50ms: 获取市场数据")
-            print("• T-10ms: 准备订单参数")
-            print(f"• T-0ms: 发送订单 ({concurrent_orders}个并发)")
-
-            # 执行订单
-            orders = []
-            successful_orders = []
-            total_filled = 0
-            total_cost = 0
-
-            for i in range(concurrent_orders):
-                try:
-                    order = await client.create_market_buy_order(
-                symbol=symbol,
-                        amount=amount/concurrent_orders
-                    )
-                    orders.append(order)
-                    if order['status'] == 'closed':
-                        successful_orders.append(order)
-                        total_filled += float(order['filled'])
-                        total_cost += float(order['cost'])
-                except Exception as e:
-                    logger.error(f"订单 {i+1} 执行失败: {str(e)}")
-
-            # 打印订单执行结果
-            print("\n[订单执行结果]")
-            for i, order in enumerate(orders, 1):
-                if order['status'] == 'closed':
-                    print(f"✓ 订单{i}: 成交")
-                    print(f"  - 订单号: {order['id']}")
-                    print(f"  - 成交价: {format_number(order['average'])} USDT")
-                    print(f"  - 成交量: {format_number(order['filled'])} {symbol.split('/')[0]}")
-                    print(f"  - 成交额: {format_number(order['cost'])} USDT\n")
-            else:
-                    print(f"✗ 订单{i}: 未成交")
-                    print(f"  - 原因: {order.get('info', {}).get('msg', '未知原因')}\n")
-
-            if successful_orders:
-                # 成交统计
-                avg_price = total_cost / total_filled if total_filled else 0
-                fee_rate = 0.001  # 0.1% 交易手续费
-                fee_cost = total_cost * fee_rate
-
-                print("[成交统计]")
-                print(f"• 总成交量: {format_number(total_filled)} {symbol.split('/')[0]}")
-                print(f"• 平均成交价: {format_number(avg_price)} USDT")
-                print(f"• 总成交金额: {format_number(total_cost)} USDT")
-                print(f"• 手续费: {format_number(fee_cost)} USDT\n")
-
-                # 设置止盈止损
-                stop_loss_price = avg_price * 0.9  # 10%止损
-                take_profit_levels = [
-                    (avg_price * 1.2, total_filled * 0.3),  # 20%止盈, 30%仓位
-                    (avg_price * 1.5, total_filled * 0.35), # 50%止盈, 35%仓位
-                    (avg_price * 2.0, total_filled * 0.35)  # 100%止盈, 35%仓位
-                ]
-
-                print("[止盈止损设置]")
-                print("✓ 止损单已设置")
-                print(f"  - 触发价: {format_number(stop_loss_price)} USDT (-10%)")
-                print(f"  - 数量: {format_number(total_filled)} {symbol.split('/')[0]}\n")
-                
-                print("✓ 止盈单已设置")
-                for i, (price, amount) in enumerate(take_profit_levels, 1):
-                    profit_percent = ((price / avg_price) - 1) * 100
-                    print(f"  - 第{i}档: {format_number(price)} USDT (+{profit_percent:.0f}%), 数量: {format_number(amount)} {symbol.split('/')[0]}")
-
-                # 模拟当前行情
-                current_price = avg_price * 1.16  # 模拟上涨16%
-                unrealized_profit = (current_price - avg_price) * total_filled
-                profit_percent = (unrealized_profit / total_cost) * 100
-
-                print("\n[实时行情]")
-                print(f"当前价格: {format_number(current_price)} USDT")
-                print(f"涨幅: +16%")
-                print(f"预计盈利: {format_number(unrealized_profit)} USDT ({profit_percent:.2f}%)")
-
-                print("\n=== 抢购任务执行完成 ===")
-                print("建议:")
-                print("1. 密切关注价格走势")
-                print("2. 及时调整止盈止损策略")
-                print("3. 注意市场风险")
-
-                return successful_orders[0]  # 返回第一个成功的订单
-
-            else:
-                print("\n❌ 抢购失败: 所有订单均未成交")
-                return None
-            
-        except Exception as e:
-            logger.error(f"抢购执行失败: {str(e)}")
-            print(f"\n❌ 抢购执行失败: {str(e)}")
-            return None
-        finally:
-            # 确保停止数据更新
-            if self.market_cache:
-                await self.market_cache.stop()
-
-    def _is_price_safe(self, current_price: float, target_price: float) -> bool:
-        """检查价格是否在安全范围内"""
-        deviation = abs(current_price - target_price) / target_price
-        if deviation > self.max_price_deviation:
-            logger.warning(f"价格偏差过大: 目标 {target_price}, 当前 {current_price}, 偏差 {deviation*100:.2f}%")
-            return False
-        return True
-
-# 网络优化器
-class NetworkOptimizer:
-    def __init__(self):
-        self.connection_pool = aiohttp.TCPConnector(
-            limit=100,
-            ttl_dns_cache=300,
-            use_dns_cache=True,
-            force_close=False
-        )
-        self.session = None
-        self.endpoints = []
-        self.best_endpoint = None
-        self.latency_stats = defaultdict(list)
-        
-    async def initialize(self):
-        """初始化网络连接"""
-        self.session = aiohttp.ClientSession(
-            connector=self.connection_pool,
-            timeout=aiohttp.ClientTimeout(total=5)
-        )
-        
-    async def optimize_connection(self, url: str):
-        """优化到特定URL的连接"""
-        try:
-            # 预连接
-            async with self.session.get(url) as response:
-                await response.read()
-                
-            # 测试延迟
-            start = time.perf_counter()
-            async with self.session.get(url) as response:
-                await response.read()
-            latency = (time.perf_counter() - start) * 1000
-            
-            return latency
-            
-        except Exception as e:
-            logger.error(f"连接优化失败: {str(e)}")
-            return None
-            
-    async def test_endpoints(self, endpoints: List[str]) -> Dict[str, float]:
-        """测试多个端点的延迟"""
-        results = {}
-        for endpoint in endpoints:
-            latency = await self.optimize_connection(endpoint)
-            if latency:
-                results[endpoint] = latency
-                self.latency_stats[endpoint].append(latency)
-        
-        # 更新最佳端点
-        if results:
-            self.best_endpoint = min(results.items(), key=lambda x: x[1])[0]
-            
-        return results
-        
-    def get_best_endpoint(self) -> Optional[str]:
-        """获取最佳端点"""
-        return self.best_endpoint
-        
-    def get_latency_stats(self, endpoint: str) -> Dict:
-        """获取端点延迟统计"""
-        if not self.latency_stats[endpoint]:
-            return {}
-            
-        latencies = self.latency_stats[endpoint]
-        return {
-            'min': min(latencies),
-            'max': max(latencies),
-            'avg': sum(latencies) / len(latencies),
-            'count': len(latencies)
-        }
-        
-    async def cleanup(self):
-        """清理资源"""
-        if self.session:
-            await self.session.close()
-        self.latency_stats.clear()
-
-# 实时监控系统
 class RealTimeMonitor:
+    """实时监控系统"""
     def __init__(self):
         self.metrics = {
             'order_latency': [],
@@ -768,7 +924,6 @@ class RealTimeMonitor:
             'error_count': 0
         }
         
-        # Prometheus指标
         self.prom_metrics = {
             'order_latency': prom.Histogram(
                 'order_latency_seconds',
@@ -787,14 +942,6 @@ class RealTimeMonitor:
             'error_count': prom.Counter(
                 'error_total',
                 'Total number of errors'
-            ),
-            'memory_usage': prom.Gauge(
-                'memory_usage_bytes',
-                'Memory usage in bytes'
-            ),
-            'cpu_usage': prom.Gauge(
-                'cpu_usage_percent',
-                'CPU usage percentage'
             )
         }
         
@@ -808,7 +955,7 @@ class RealTimeMonitor:
         if success:
             self.metrics['success_rate'] = (
                 self.metrics['success_rate'] * 0.9 + 0.1
-            )  # 指数移动平均
+            )
         else:
             self.metrics['success_rate'] = self.metrics['success_rate'] * 0.9
             
@@ -953,13 +1100,9 @@ def timing_decorator(category: str):
 class ConfigManager:
     """配置管理器"""
     def __init__(self):
-        # 设置配置目录和文件路径
-        self.config_dir = 'config'
-        self.config_file = os.path.join(self.config_dir, 'api_config.ini')
-        
-        # 确保配置目录存在
-        if not os.path.exists(self.config_dir):
-            os.makedirs(self.config_dir)
+        # 设置配置目录
+        self.config_dir = CONFIG_DIR  # 使用全局定义的 CONFIG_DIR
+        self.config_file = os.path.join(self.config_dir, 'config.json')
         
         # 初始化配置解析器
         self.config = configparser.ConfigParser()
@@ -969,6 +1112,9 @@ class ConfigManager:
             self.config.read(self.config_file)
         else:
             self._create_default_config()
+            
+        # 确保配置目录存在
+        os.makedirs(self.config_dir, exist_ok=True)
     
     def _create_default_config(self):
         """创建默认配置"""
@@ -1080,6 +1226,14 @@ MarketData = Dict[str, Union[float, str]]
 Timestamp = float
 T = TypeVar('T')  # 用于泛型方法
 
+# 在文件开头添加时区设置
+timezone = pytz.timezone('Asia/Shanghai')
+
+def format_local_time(timestamp_ms: int) -> str:
+    """将毫秒时间戳转换为本地时间字符串"""
+    dt = datetime.fromtimestamp(timestamp_ms/1000, timezone)
+    return dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
 class BinanceSniper:
     """币安抢币工具核心类"""
     
@@ -1110,24 +1264,109 @@ class BinanceSniper:
         'POOR': 500       # 较差: >200ms
     }
     
-    def __init__(self,
-                 symbol: str,
-                 trade_client,
-                 query_client,
-                 amount: float = None,
-                 sell_strategy: List[Tuple[float, float]] = None):
-        self.symbol = symbol
-        self.trade_client = trade_client
-        self.query_client = query_client
-        self.amount = amount
-        self.sell_strategy = sell_strategy or [(0.2, 0.3), (0.5, 0.35), (1.0, 0.35)]
-        self.market_cache = None  # 添加market_cache属性
+    def __init__(self, config: ConfigManager):
+        """初始化币安抢币工具
+        Args:
+            config: 配置管理器实例
+        """
+        # 1. 首先初始化logger
+        self.logger = setup_logger()
+        
+        # 2. 基础配置
+        self.config = config
+        self.trade_client = None
+        self.query_client = None
+        
+        # 3. 设置时区
+        self.timezone = pytz.timezone('Asia/Shanghai')
+        
+        # 4. 基础变量
+        self.symbol = None
+        self.amount = None
+        self.price = None
+        self.sell_strategy = None
+        self.market_cache = None
+        
+        # 5. 初始化基本组件
+        self._init_basic_components()
+        
+        # 6. 初始化依赖logger的组件
+        self.ip_manager = IPManager(self.logger)
+        self.market_data_cache = {}
+        self.cache_ttl = 0.02  # 20ms缓存
+        
+        # 7. WebSocket相关
+        self.websocket = None
+        self.order_update_queue = asyncio.Queue()
+        self.price_update_queue = asyncio.Queue()
+        self.ws_connections = {}
+        self.last_rest_request = {}
+        self.ws_manager = None
+        
+        # 8. 性能监控
+        self.perf = PerformanceAnalyzer()
+        
+        # 9. 资源跟踪
+        self._resources = set()
+        
+        self.logger.info("BinanceSniper初始化完成")
+
+        # 添加时间同步相关属性
+        self.server_time_offset = 0  # 与币安服务器的时间差(ms)
+        self.last_time_sync = 0      # 上次同步时间
+        self.time_sync_interval = 1   # 同步间隔(秒)
+        self.time_samples = deque(maxlen=100)  # 保存最近100次时间同步样本
+
+        # 添加市场数据监控相关的属性
+        self.market_status = {
+            'symbol_active': False,
+            'has_orderbook': False,
+            'has_trades': False,
+            'last_update': 0
+        }
+
+    def _init_basic_components(self):
+        """初始化基本组件"""
+        try:
+            # 获取API密钥
+            trade_api_key, trade_api_secret = self.config.get_trade_api_keys()
+            query_api_key, query_api_secret = self.config.get_query_api_keys()
+            
+            # 如果有API密钥，则初始化客户端
+            if trade_api_key and trade_api_secret:
+                self.trade_client = ccxt.binance({
+                    'apiKey': trade_api_key,
+                    'secret': trade_api_secret,
+                    'enableRateLimit': True,
+                    'options': {
+                        'defaultType': 'spot',
+                        'adjustForTimeDifference': True
+                    }
+                })
+                
+                self.query_client = ccxt.binance({
+                    'apiKey': query_api_key,
+                    'secret': query_api_secret,
+                    'enableRateLimit': True,
+                    'options': {
+                        'defaultType': 'spot',
+                        'adjustForTimeDifference': True
+                    }
+                })
+                
+                self.logger.info("API客户端初始化成功")
+        except Exception as e:
+            self.logger.warning(f"初始化基本组件时出错: {str(e)}")
         
     async def start_market_cache(self):
         """启动市场数据缓存"""
         if not self.market_cache:
             self.market_cache = MarketDataCache(self.query_client)
+            # 使用已分配的IP
+            if hasattr(self, 'execution_ips'):
+                self.market_cache.set_ip(self.execution_ips['primary'])
             await self.market_cache.start(self.symbol)
+            self.logger.info(f"市场数据缓存已启动: {self.symbol}")
             
     async def stop_market_cache(self):
         """停止市场数据缓存"""
@@ -1992,7 +2231,11 @@ class BinanceSniper:
         """启动市场数据缓存"""
         if not self.market_cache:
             self.market_cache = MarketDataCache(self.query_client)
+            # 使用已分配的IP
+            if hasattr(self, 'execution_ips'):
+                self.market_cache.set_ip(self.execution_ips['primary'])
             await self.market_cache.start(self.symbol)
+            self.logger.info(f"市场数据缓存已启动: {self.symbol}")
             
     async def stop_market_cache(self):
         """停止市场数据缓存"""
@@ -3577,8 +3820,12 @@ class BinanceSniper:
 
     async def init_market_stream(self):
         """初始化市场数据流"""
-        self.ws_client = BinanceWebSocket(self.symbol)
-        return await self.ws_client.connect()
+        if not self.ws_manager:
+            self.ws_manager = BinanceWebSocketManager(self.symbol, self.logger)
+            # 为每个可用IP添加连接
+            for ip in self.ip_manager.get_available_ips():
+                await self.ws_manager.add_connection(ip)
+        return True
     
     async def _fetch_market_data_ws(self) -> Optional[Dict]:
         """通过WebSocket获取市场数据"""
@@ -4526,6 +4773,472 @@ class BinanceSniper:
         # 过滤异常值
         return [x for x in data if q1 - 1.5*iqr <= x <= q3 + 1.5*iqr]
 
+    async def _make_request(self, url: str, method: str = "GET", **kwargs):
+        """优化的API请求方法"""
+        cache_key = f"{url}_{kwargs.get('params', '')}"
+        current_time = time.time()
+        
+        # 检查缓存
+        if cache_key in self.market_data_cache:
+            cache_data = self.market_data_cache[cache_key]
+            if current_time - cache_data['timestamp'] < self.cache_ttl:
+                return cache_data['data']
+
+        # 获取最佳IP并检查请求限制
+        ip = await self.ip_manager.get_best_ip()
+        if ip not in self.last_rest_request:
+            self.last_rest_request[ip] = []
+            
+        # 清理旧的请求记录
+        self.last_rest_request[ip] = [t for t in self.last_rest_request[ip] 
+                                    if current_time - t < 60]
+                                    
+        # 检查是否超过限制
+        if len(self.last_rest_request[ip]) >= 1100:
+            self.logger.warning(f"IP {ip} 接近请求限制，等待重置")
+            await asyncio.sleep(0.1)
+            
+        try:
+            kwargs['source_address'] = (ip, 0)
+            async with aiohttp.ClientSession() as session:
+                async with getattr(session, method.lower())(url, **kwargs) as response:
+                    data = await response.json()
+                    
+                    # 更新缓存和请求计数
+                    self.market_data_cache[cache_key] = {
+                        'data': data,
+                        'timestamp': current_time
+                    }
+                    self.last_rest_request[ip].append(current_time)
+                    return data
+                    
+        except Exception as e:
+            await self.ip_manager.report_error(ip)
+            self.logger.error(f"请求失败 (IP: {ip}): {e}")
+            raise
+
+    async def get_market_data(self, symbol: str) -> Dict:
+        """优化的市场数据获取"""
+        try:
+            # 1. 先检查缓存
+            cache_key = f"{symbol}_market_data"
+            current_time = time.time()
+            
+            if (cache_key in self.market_data_cache and 
+                current_time - self.market_data_cache[cache_key]['timestamp'] < self.cache_ttl):
+                return self.market_data_cache[cache_key]
+
+            # 2. 使用已分配的IP获取数据
+            if hasattr(self, 'execution_ips'):
+                ip = self.execution_ips['primary']  # 使用主IP
+            else:
+                ip = await self.ip_manager.get_best_ip()
+
+            # 3. 获取数据
+            params = {'symbol': symbol}
+            ticker = await self.query_client.fetch_ticker(symbol)
+            orderbook = await self.query_client.fetch_order_book(symbol)
+            
+            # 4. 整合数据
+            market_data = {
+                'ticker': ticker,
+                'orderbook': orderbook,
+                'timestamp': current_time,
+                'price': float(ticker['last']),
+                'bid': float(ticker['bid']),
+                'ask': float(ticker['ask']),
+                'volume': float(ticker['baseVolume'])
+            }
+            
+            # 5. 更新缓存和状态
+            self.market_data_cache[cache_key] = market_data
+            self._update_market_status(market_data)
+            
+            return market_data
+
+        except Exception as e:
+            self.logger.error(f"获取市场数据失败: {e}")
+            raise
+
+    def _update_market_status(self, market_data: Dict):
+        """更新市场状态"""
+        self.market_status = {
+            'symbol_active': True,
+            'has_orderbook': bool(market_data['orderbook']['bids'] or market_data['orderbook']['asks']),
+            'has_trades': market_data['volume'] > 0,
+            'last_update': time.time()
+        }
+
+    async def monitor_market_status(self):
+        """持续监控市场状态"""
+        while True:
+            try:
+                # 使用已分配的IP
+                if hasattr(self, 'execution_ips'):
+                    ip = self.execution_ips['primary']
+                else:
+                    ip = await self.ip_manager.get_best_ip()
+
+                # 获取最新市场数据
+                market_data = await self.get_market_data(self.symbol)
+                
+                # 分析价格变动
+                if 'last_price' in self.market_status:
+                    price_change = abs(market_data['price'] - self.market_status['last_price'])
+                    if price_change > self.price_change_threshold:
+                        self.logger.warning(f"价格剧烈波动: {price_change}")
+
+                # 分析深度变化
+                if market_data['orderbook']['bids'] and market_data['orderbook']['asks']:
+                    spread = float(market_data['orderbook']['asks'][0][0]) - float(market_data['orderbook']['bids'][0][0])
+                    if spread > self.spread_threshold:
+                        self.logger.warning(f"买卖价差过大: {spread}")
+
+                # 更新状态
+                self.market_status['last_price'] = market_data['price']
+                
+                await asyncio.sleep(0.1)  # 100ms检查间隔
+                
+            except Exception as e:
+                self.logger.error(f"市场状态监控失败: {str(e)}")
+                await asyncio.sleep(1)  # 出错后等待1秒
+
+    async def batch_market_data(self, symbols: List[str]) -> Dict:
+        """批量获取多个交易对的市场数据"""
+        try:
+            # 使用已分配的IP
+            if hasattr(self, 'execution_ips'):
+                tasks = [
+                    self.get_market_data(symbol) 
+                    for symbol in symbols
+                ]
+            else:
+                # 如果IP未分配，使用多IP并发
+                tasks = []
+                for i, symbol in enumerate(symbols):
+                    ip_index = i % len(self.ip_manager.ips)
+                    tasks.append(
+                        self.get_market_data(
+                            symbol, 
+                            ip=self.ip_manager.ips[ip_index]
+                        )
+                    )
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            market_data = {}
+            for symbol, result in zip(symbols, results):
+                if isinstance(result, Exception):
+                    self.logger.warning(f"{symbol} 数据获取失败: {result}")
+                    continue
+                market_data[symbol] = result
+                
+            return market_data
+            
+        except Exception as e:
+            self.logger.error(f"批量获取市场数据失败: {e}")
+            raise
+
+    async def sync_server_time(self) -> float:
+        """同步币安服务器时间"""
+        try:
+            local_send_time = time.time() * 1000
+            server_time = await self.query_client.fetch_time()
+            local_recv_time = time.time() * 1000
+            
+            # 计算网络延迟
+            network_latency = (local_recv_time - local_send_time) / 2
+            
+            # 计算时间偏差
+            server_time_ms = server_time['serverTime']
+            time_offset = server_time_ms - (local_send_time + network_latency)
+            
+            # 保存样本
+            self.time_samples.append({
+                'offset': time_offset,
+                'latency': network_latency,
+                'timestamp': local_send_time
+            })
+            
+            # 计算稳定的时间偏差(使用中位数)
+            recent_offsets = [sample['offset'] for sample in self.time_samples]
+            self.server_time_offset = statistics.median(recent_offsets)
+            
+            self.last_time_sync = local_send_time
+            self.logger.debug(f"时间同步完成: 偏差 {self.server_time_offset}ms, 延迟 {network_latency}ms")
+            
+            return network_latency
+            
+        except Exception as e:
+            self.logger.error(f"同步服务器时间失败: {str(e)}")
+            raise TimeError("无法同步服务器时间")
+
+    def get_server_time(self) -> float:
+        """获取当前币安服务器时间(毫秒)"""
+        return time.time() * 1000 + self.server_time_offset
+
+    async def maintain_time_sync(self):
+        """维护时间同步"""
+        while True:
+            try:
+                current_time = time.time() * 1000
+                if current_time - self.last_time_sync >= self.time_sync_interval * 1000:
+                    await self.sync_server_time()
+                await asyncio.sleep(0.1)  # 100ms检查一次
+            except Exception as e:
+                self.logger.error(f"时间同步维护失败: {str(e)}")
+                await asyncio.sleep(1)  # 出错后等待1秒再试
+
+    async def calculate_execution_time(self, target_time: float) -> float:
+        """计算实际执行时间
+        Args:
+            target_time: 目标执行时间(毫秒)
+        Returns:
+            实际应该执行的时间(毫秒)
+        """
+        # 确保时间同步是最新的
+        if time.time() * 1000 - self.last_time_sync >= self.time_sync_interval * 1000:
+            await self.sync_server_time()
+        
+        # 获取最近的网络延迟样本
+        recent_latencies = [sample['latency'] for sample in self.time_samples]
+        if not recent_latencies:
+            raise TimeError("没有足够的网络延迟样本")
+        
+        # 使用95分位数作为网络延迟估计
+        network_latency = statistics.quantiles(recent_latencies, n=20)[-1]
+        
+        # 计算完整提前量
+        advance_time = network_latency + 50  # 网络延迟 + 50ms安全边际
+        
+        # 返回实际执行时间(考虑服务器时间偏差)
+        return target_time - advance_time
+
+    async def check_symbol_status(self) -> dict:
+        """检查交易对状态
+        Returns:
+            dict: {
+                'active': bool,  # 交易对是否可用
+                'status': str,   # 交易对状态
+                'msg': str       # 详细信息
+            }
+        """
+        try:
+            # 使用3个IP并发检查
+            tasks = []
+            for ip in list(self.ip_manager.ips)[:3]:
+                if await self.ip_manager.scheduler.can_make_request(ip, 'market'):
+                    tasks.append(self._check_symbol_with_ip(ip))
+            
+            if not tasks:
+                raise MarketError("没有可用的IP进行检查")
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            valid_results = [r for r in results if not isinstance(r, Exception)]
+            
+            if not valid_results:
+                return {
+                    'active': False,
+                    'status': 'error',
+                    'msg': '所有IP检查失败'
+                }
+            
+            # 任一IP检查成功即可
+            for result in valid_results:
+                if result['active']:
+                    return result
+            
+            return valid_results[0]  # 返回第一个结果
+            
+        except Exception as e:
+            self.logger.error(f"检查交易对状态失败: {str(e)}")
+            return {
+                'active': False,
+                'status': 'error',
+                'msg': str(e)
+            }
+
+    async def _check_symbol_with_ip(self, ip: str) -> dict:
+        """使用指定IP检查交易对状态"""
+        try:
+            # 1. 检查交易对信息
+            exchange_info = await self.query_client.fetch_markets()
+            symbol_info = None
+            
+            for market in exchange_info:
+                if market['symbol'] == self.symbol:
+                    symbol_info = market
+                    break
+            
+            if not symbol_info:
+                return {
+                    'active': False,
+                    'status': 'not_found',
+                    'msg': f'交易对 {self.symbol} 不存在'
+                }
+            
+            # 2. 检查订单簿
+            orderbook = await self.query_client.fetch_order_book(self.symbol)
+            has_orderbook = bool(orderbook['bids'] or orderbook['asks'])
+            
+            # 3. 检查24小时统计
+            ticker = await self.query_client.fetch_ticker(self.symbol)
+            
+            # 4. 综合判断
+            is_active = (
+                symbol_info.get('active', False) and
+                has_orderbook and
+                ticker.get('baseVolume', 0) > 0
+            )
+            
+            return {
+                'active': is_active,
+                'status': 'ready' if is_active else 'not_ready',
+                'msg': '交易对可用' if is_active else '交易对未准备就绪',
+                'orderbook': has_orderbook,
+                'info': symbol_info
+            }
+            
+        except Exception as e:
+            await self.ip_manager.report_error(ip)
+            raise MarketError(f"IP {ip} 检查失败: {str(e)}")
+
+    async def execute_orders_with_strategy(self) -> List[dict]:
+        """使用分批策略执行订单
+        Returns:
+            List[dict]: 成功执行的订单列表
+        """
+        orders = []
+        execution_start = self.get_server_time()
+        
+        try:
+            # 确保交易对可用
+            status = await self.check_symbol_status()
+            if not status['active']:
+                raise MarketError(f"交易对不可用: {status['msg']}")
+
+            # 第1批: T+0ms (2个订单)
+            self.logger.info("执行第1批订单...")
+            first_batch = await self._execute_batch(
+                batch_size=2,
+                time_offset=0,
+                ip=self.execution_ips['primary']
+            )
+            if first_batch:
+                self.logger.info(f"第1批订单成功, 数量: {len(first_batch)}")
+                return first_batch
+
+            # 第2批: T+5ms (2个订单)
+            self.logger.info("执行第2批订单...")
+            second_batch = await self._execute_batch(
+                batch_size=2,
+                time_offset=5,
+                ip=self.execution_ips['secondary']
+            )
+            if second_batch:
+                self.logger.info(f"第2批订单成功, 数量: {len(second_batch)}")
+                return second_batch
+
+            # 第3批: T+10ms (1个订单)
+            self.logger.info("执行第3批订单...")
+            final_batch = await self._execute_batch(
+                batch_size=1,
+                time_offset=10,
+                ip=self.execution_ips['fallback']
+            )
+            if final_batch:
+                self.logger.info(f"第3批订单成功, 数量: {len(final_batch)}")
+                return final_batch
+
+            total_time = self.get_server_time() - execution_start
+            self.logger.warning(f"所有批次执行完成，总耗时: {total_time}ms，无成功订单")
+            return []
+
+        except Exception as e:
+            self.logger.error(f"订单执行策略失败: {str(e)}")
+            return orders
+
+    async def _execute_batch(self, batch_size: int, time_offset: int, ip: str) -> List[dict]:
+        """执行一批订单
+        Args:
+            batch_size: 订单数量
+            time_offset: 相对于基准时间的偏移(ms)
+            ip: 使用的IP地址
+        Returns:
+            List[dict]: 成功的订单列表
+        """
+        orders = []
+        try:
+            # 计算执行时间
+            base_time = self.get_server_time()
+            execution_time = base_time + time_offset
+
+            # 创建订单任务
+            tasks = []
+            for _ in range(batch_size):
+                tasks.append(self._place_single_order(
+                    ip=ip,
+                    execution_time=execution_time
+                ))
+
+            # 并发执行订单
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # 处理结果
+            for result in results:
+                if isinstance(result, Exception):
+                    self.logger.error(f"订单执行失败: {str(result)}")
+                    continue
+                if result and result.get('status') == 'filled':
+                    orders.append(result)
+
+            return orders
+
+        except Exception as e:
+            self.logger.error(f"批次执行失败: {str(e)}")
+            return orders
+
+    async def _place_single_order(self, ip: str, execution_time: float) -> Optional[dict]:
+        """执行单个订单
+        Args:
+            ip: 使用的IP
+            execution_time: 目标执行时间(ms)
+        Returns:
+            Optional[dict]: 订单结果
+        """
+        try:
+            # 等待直到执行时间
+            current_time = self.get_server_time()
+            if current_time < execution_time:
+                wait_time = (execution_time - current_time) / 1000
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+
+            # 准备订单参数
+            order_params = {
+                'symbol': self.symbol,
+                'type': 'LIMIT',
+                'side': 'BUY',
+                'price': self.price,
+                'amount': self.amount,
+                'timeInForce': 'GTC',
+                'timestamp': int(execution_time)
+            }
+
+            # 执行订单
+            start_time = self.get_server_time()
+            order = await self.trade_client.create_order(**order_params)
+            execution_latency = self.get_server_time() - start_time
+
+            # 记录执行延迟
+            self.logger.info(f"订单执行完成 - IP: {ip}, 延迟: {execution_latency}ms")
+            
+            return order
+
+        except Exception as e:
+            await self.ip_manager.report_error(ip)
+            raise ExecutionError(f"订单执行失败: {str(e)}")
+
 class ErrorHandler:
     """统一错误处理"""
     def __init__(self):
@@ -4818,6 +5531,62 @@ class ErrorHandler:
             except Exception as e:
                 logger.error(f"清理测试订单失败: {str(e)}")
 
+    async def monitor_symbol_status(self):
+        """持续监控交易对状态"""
+        while True:
+            try:
+                status = await self.check_symbol_status()
+                if status['active']:
+                    self.logger.info(f"交易对 {self.symbol} 状态: {status['msg']}")
+                    return True
+                else:
+                    self.logger.debug(f"交易对 {self.symbol} 状态: {status['msg']}")
+                await asyncio.sleep(0.1)  # 100ms检查一次
+            except Exception as e:
+                self.logger.error(f"监控交易对状态失败: {str(e)}")
+                await asyncio.sleep(1)  # 出错后等待1秒
+
+    async def prepare_ips(self):
+        """IP准备和角色分配
+        Returns:
+            bool: 是否成功
+        """
+        try:
+            available_ips = list(self.ip_manager.ips)
+            if len(available_ips) < 3:
+                raise RuntimeError(f"可用IP不足，当前只有 {len(available_ips)} 个IP")
+
+            # 简单分配IP角色
+            self.execution_ips = {
+                'primary': available_ips[0],    # 第一个IP作为主要IP
+                'secondary': available_ips[1],   # 第二个IP作为次要IP
+                'fallback': available_ips[2]     # 第三个IP作为备用IP
+            }
+
+            self.logger.info(f"IP角色分配完成: {self.execution_ips}")
+            self.ip_roles_locked = True
+            return True
+
+        except Exception as e:
+            self.logger.error(f"IP准备失败: {str(e)}")
+            return False
+
+    async def validate_ips(self):
+        """验证所有IP可用性"""
+        try:
+            for role, ip in self.execution_ips.items():
+                # 简单的连接测试
+                response = await self.query_client.ping(ip=ip)
+                if not response:
+                    raise NetworkError(f"IP {ip} ({role}) 连接测试失败")
+                
+            self.logger.info("所有IP验证通过")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"IP验证失败: {str(e)}")
+            return False
+
 def print_menu(clear=True):
     """打印主菜单"""
     print("\n=== 币安现货抢币工具 ===")
@@ -4957,8 +5726,8 @@ def main():
         # 初始化配置管理器
         config = ConfigManager()
         
-        # 初始化币安抢币工具
-        sniper = BinanceSniper(config)
+        # 初始化币安抢币工具 - 只修改这一行
+        sniper = BinanceSniper(config)  # 只传入 config
 
         while True:
             print_menu()
