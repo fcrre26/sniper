@@ -5432,28 +5432,35 @@ class BinanceSniper:
         # 创建IP请求队列
         ip_queues = {ip: asyncio.Queue() for ip in self.ip_manager.ips}
         
-        # 创建IP请求任务
-        async def ip_worker(ip: str, queue: asyncio.Queue):
+        # 修改 ip_worker 函数
+        async def ip_worker(ip: str, queue: asyncio.Queue, offset_ms: int):
+            await asyncio.sleep(offset_ms / 1000)  # 初始错开等待
             while time.time() - start_time < duration:
                 try:
                     req_start = time.time()
-                    ticker = await self.query_client.fetch_ticker(self.symbol)
-                    
-                    if ticker:
-                        latency = (time.time() - req_start) * 1000
-                        await queue.put(('success', latency))
-                        
+                    # 直接使用 REST API 而不是 CCXT
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            'https://api.binance.com/api/v3/ticker/24hr',
+                            params={'symbol': self.symbol.replace('/', '')},
+                            timeout=2,
+                            headers={'User-Agent': 'Mozilla/5.0'}
+                        ) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                latency = (time.time() - req_start) * 1000
+                                await queue.put(('success', latency))
+                            else:
+                                await queue.put(('error', f'HTTP {response.status}'))
+                                
+                except asyncio.TimeoutError:
+                    await queue.put(('error', 'Timeout'))
                 except Exception as e:
                     await queue.put(('error', str(e)))
                 
-                # 动态调整请求间隔
-                await asyncio.sleep(0.01)  # 10ms基础间隔
-        
-        # 启动IP工作任务
-        workers = [asyncio.create_task(ip_worker(ip, queue)) 
-                  for ip, queue in ip_queues.items()]
-        
-        # 处理结果的任务
+                await asyncio.sleep(0.054)  # 54ms间隔
+
+        # 添加结果处理函数
         async def process_results():
             while time.time() - start_time < duration:
                 for ip, queue in ip_queues.items():
@@ -5468,8 +5475,8 @@ class BinanceSniper:
                             stats['max_latency'] = max(stats['max_latency'], latency)
                         else:
                             stats['error_count'] += 1
-                            error_type = type(data).__name__
-                            stats['errors'][error_type] += 1
+                            error_type = str(data)
+                            stats['errors'][error_type] = stats['errors'].get(error_type, 0) + 1
                             
                 # 更新显示
                 now = time.time()
@@ -5483,10 +5490,8 @@ class BinanceSniper:
                     avg_latency = sum(recent_latencies) / len(recent_latencies) if recent_latencies else 0
                     
                     # 获取WebSocket消息计数
-                    if hasattr(self, 'ws_manager') and self.ws_manager and hasattr(self.ws_manager, 'stats'):
-                        stats['ws_messages'] = self.ws_manager.stats['message_count']
-                    else:
-                        stats['ws_messages'] = 0
+                    if hasattr(self, 'ws_manager') and self.ws_manager:
+                        stats['ws_messages'] = getattr(self.ws_manager, 'message_count', 0)
                     
                     print(f"\r状态: "
                           f"运行时间: {int(now - start_time)}s/{duration}s | "
@@ -5501,19 +5506,44 @@ class BinanceSniper:
                 
                 await asyncio.sleep(0.001)  # 避免CPU过载
 
-        # 启动结果处理任务
-        processor = asyncio.create_task(process_results())
-        
         try:
-            # 等待所有任务完成
-            await asyncio.gather(*workers, processor)
+            # 创建IP工作任务
+            workers = []
+            for i, ip in enumerate(self.ip_manager.ips):
+                offset = i * 18  # 错开18ms启动
+                workers.append(asyncio.create_task(ip_worker(ip, ip_queues[ip], offset)))
+            
+            # 添加结果处理任务
+            processor = asyncio.create_task(process_results())
+            
+            # 等待所有任务完成或超时
+            await asyncio.wait(
+                [*workers, processor],
+                timeout=duration,
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+        except asyncio.CancelledError:
+            print("\n测试被取消")
         except KeyboardInterrupt:
-            print("\n\n测试被用户中断")
+            print("\n测试被用户中断")
+        except Exception as e:
+            print(f"\n测试出错: {str(e)}")
         finally:
-            # 取消所有任务
-            for worker in workers:
-                worker.cancel()
-            processor.cancel()
+            # 清理任务
+            for task in [*workers, processor]:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            
+            # 关闭 WebSocket 连接
+            if hasattr(self, 'ws_manager'):
+                await self.ws_manager.close()
+
+            print("\n测试结束")
 
         # 生成详细报告
         total_time = time.time() - start_time
@@ -6135,10 +6165,29 @@ async def main():
         logger.error(f"程序运行出错: {str(e)}", exc_info=True)
 
 if __name__ == '__main__':
-    # 创建事件循环
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
+        # 创建事件循环
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # 设置信号处理
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda: asyncio.create_task(cleanup()))
+            
+        # 运行主程序
         loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        print("\n程序被用户中断")
+    except Exception as e:
+        print(f"程序运行出错: {str(e)}")
+        logger.error(f"程序运行出错: {str(e)}", exc_info=True)
     finally:
-        loop.close()
+        # 清理并关闭事件循环
+        try:
+            tasks = asyncio.all_tasks(loop)
+            for task in tasks:
+                task.cancel()
+            loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        finally:
+            loop.close()
