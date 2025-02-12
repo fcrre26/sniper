@@ -31,7 +31,7 @@ initialize_environment() {
 
     # 2. 安装Python依赖
     echo -e "${YELLOW}安装Python依赖...${NC}"
-    pip3 install ccxt aiohttp websocket-client requests cryptography prometheus_client psutil pytz netifaces
+    pip3 install ccxt aiohttp websocket-client requests cryptography prometheus_client psutil pytz netifaces websockets
 
     # 3. 创建必要的目录
     echo -e "${YELLOW}创建必要的目录...${NC}"
@@ -65,6 +65,10 @@ echo -e "${GREEN}====== 币安现货抢币工具 ======${NC}"
 echo -e "${YELLOW}配置IPv6...${NC}"
 
 # 检查AWS实例类型
+if ! command -v aws &> /dev/null; then
+    echo -e "${YELLOW}AWS CLI未安装，跳过AWS相关配置${NC}"
+else
+    # 获取实例ID
 INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
 if [ -z "$INSTANCE_ID" ]; then
     echo -e "${RED}不是AWS实例，跳过IPv6配置${NC}"
@@ -122,6 +126,7 @@ EOF
         fi
     else
         echo -e "${RED}未找到网络接口${NC}"
+        fi
     fi
 fi
 
@@ -1354,130 +1359,6 @@ test_binance_api_ipv6() {
     read
 }
 
-# 添加多IP配置函数
-configure_multiple_ips() {
-    echo -e "${YELLOW}配置多IP支持...${NC}"
-    
-    # 检测VPS提供商
-    if [ -f "/sys/class/dmi/id/product_version" ]; then
-        local vps_type=$(cat /sys/class/dmi/id/product_version)
-    else
-        local vps_type="unknown"
-    fi
-    
-    # 获取主网卡名称
-    local interface=$(ip route | grep default | awk '{print $5}' | head -n1)
-    if [ -z "$interface" ]; then
-        echo -e "${RED}未找到网络接口${NC}"
-        return 1
-    fi
-    
-    echo "检测到网络接口: $interface"
-    echo "VPS提供商: $vps_type"
-    
-    # 显示当前IP配置
-    echo -e "\n${YELLOW}当前IP配置:${NC}"
-    ip addr show $interface | grep "inet " | awk '{print NR". "$2" ("$NF")"}'
-    
-    echo -e "\n${YELLOW}选择操作:${NC}"
-    echo "1. 查看IP配置详情"
-    echo "2. 配置新IP地址"
-    echo "3. 测试所有IP延迟"
-    echo "4. 查看IP使用建议"
-    echo "0. 返回主菜单"
-    
-    read -p "请选择 (0-4): " ip_choice
-    case $ip_choice in
-        1)
-            echo -e "\n${YELLOW}IP配置详情:${NC}"
-            echo "1) 当前活跃IP:"
-            ip addr show $interface | grep "inet " | while read -r line; do
-                local ip=$(echo $line | awk '{print $2}')
-                local status="活跃"
-                echo "   - IP: $ip"
-                echo "     状态: $status"
-                
-                # 测试到币安API的连接
-                local pure_ip=$(echo $ip | cut -d'/' -f1)
-                local latency=$(curl -s -w "%{time_total}\n" -o /dev/null --interface $pure_ip https://api.binance.com/api/v3/time 2>/dev/null)
-                if [ $? -eq 0 ]; then
-                    echo -e "     延迟: ${GREEN}${latency}s${NC}"
-                else
-                    echo -e "     延迟: ${RED}连接失败${NC}"
-                fi
-                echo ""
-            done
-            
-            if [[ "$vps_type" == *"Vultr"* ]]; then
-                echo -e "\n2) Vultr IP管理说明:"
-                echo "   - 额外IPv4需要在Vultr控制面板购买"
-                echo "   - 每个实例默认1个IPv4地址"
-                echo "   - 可以在控制面板启用IPv6"
-            elif [[ "$vps_type" == *"amazon"* ]]; then
-                echo -e "\n2) AWS IP管理说明:"
-                echo "   - 可以申请弹性IP (Elastic IP)"
-                echo "   - 支持在VPC中分配多个私有IP"
-                echo "   - 可以使用Network Interface添加IP"
-            fi
-            ;;
-        2)
-            if [[ "$vps_type" == *"Vultr"* ]]; then
-                echo -e "\n${YELLOW}Vultr IP配置说明:${NC}"
-                echo "1. 额外IPv4地址需要在Vultr控制面板购买"
-                echo "2. 购买后，请按照以下步骤配置："
-                echo "   a) 在控制面板中添加IP"
-                echo "   b) 等待IP分配完成"
-                echo "   c) 使用以下命令配置系统："
-                echo "      ip addr add <新IP>/24 dev $interface"
-                read -p "是否已在Vultr控制面板购买新IP? (y/n): " has_new_ip
-                if [[ $has_new_ip == "y" || $has_new_ip == "Y" ]]; then
-                    read -p "请输入新分配的IP (格式: x.x.x.x/24): " new_ip
-                    if ip addr add $new_ip dev $interface 2>/dev/null; then
-                        echo -e "${GREEN}IP添加成功${NC}"
-                        test_ip_connection $new_ip
-                    else
-                        echo -e "${RED}IP添加失败，请检查IP格式或是否已被使用${NC}"
-                    fi
-                fi
-            elif [[ "$vps_type" == *"amazon"* ]]; then
-                echo -e "\n${YELLOW}AWS IP配置说明:${NC}"
-                echo "1. 弹性IP配置："
-                echo "   - 在AWS控制台申请弹性IP"
-                echo "   - 关联到当前实例"
-                echo "2. 网络接口配置："
-                echo "   - 在VPC中创建新的网络接口"
-                echo "   - 分配私有IP地址"
-                echo "3. 负载均衡配置："
-                echo "   - 使用ALB/NLB实现多IP"
-            fi
-            ;;
-        3)
-            echo -e "\n${YELLOW}测试所有IP延迟...${NC}"
-            test_all_ips_latency $interface
-            ;;
-        4)
-            echo -e "\n${YELLOW}IP使用建议:${NC}"
-            echo "1. API访问策略:"
-            echo "   - 使用多个API密钥轮换访问"
-            echo "   - 实现请求负载均衡"
-            echo "   - 监控每个IP的请求限制"
-            echo ""
-            echo "2. IP轮换策略:"
-            echo "   - 按照延迟优先级使用IP"
-            echo "   - 在达到限制前切换IP"
-            echo "   - 保持IP池的动态更新"
-            ;;
-        0)
-            return 0
-            ;;
-        *)
-            echo -e "${RED}无效选项${NC}"
-            ;;
-    esac
-    
-    read -p "按回车键继续..."
-}
-
 # 测试IP连接性能
 test_ip_connection() {
     local ip=$1
@@ -1515,134 +1396,873 @@ test_all_ips_latency() {
     done
 }
 
-# 修改主菜单，移除IPv6选项，添加多IP管理
+# 添加API限流测试脚本
+echo -e "\n${YELLOW}创建API限流测试脚本...${NC}"
+cat > test_api_rate_limit.py << 'EOF'
+import asyncio
+import aiohttp
+import time
+from datetime import datetime
+import json
+
+class BinanceAPITester:
+    def __init__(self):
+        self.base_url = 'https://api.binance.com'
+        self.results = {}
+        self.test_duration = 60  # 测试持续60秒
+        self.target_rate = 1100  # 目标请求数/分钟
+        
+    async def test_single_ip(self, ip: str):
+        print(f"\n开始测试 IP: {ip}")
+        success_count = 0
+        error_count = 0
+        latencies = []
+        
+        async with aiohttp.ClientSession() as session:
+            start_time = time.time()
+            request_count = 0
+            
+            while time.time() - start_time < self.test_duration:
+                try:
+                    req_start = time.time()
+                    async with session.get(
+                        f"{self.base_url}/api/v3/time",
+                        headers={'Content-Type': 'application/json'},
+                        timeout=2
+                    ) as response:
+                        await response.json()
+                        latency = (time.time() - req_start) * 1000
+                        latencies.append(latency)
+                        success_count += 1
+                        
+                        if success_count % 50 == 0:
+                            current_rate = success_count / (time.time() - start_time) * 60
+                            print(f"当前速率: {current_rate:.1f} 请求/分钟")
+                            
+                except Exception as e:
+                    error_count += 1
+                    print(f"请求失败: {str(e)}")
+                
+                request_count += 1
+                if request_count % 10 == 0:
+                    await asyncio.sleep(0.5)
+        
+        test_duration = time.time() - start_time
+        requests_per_minute = success_count / test_duration * 60
+        
+        result = {
+            'timestamp': datetime.now().isoformat(),
+            'success_count': success_count,
+            'error_count': error_count,
+            'requests_per_minute': requests_per_minute,
+            'avg_latency': sum(latencies) / len(latencies) if latencies else 0,
+            'min_latency': min(latencies) if latencies else 0,
+            'max_latency': max(latencies) if latencies else 0
+        }
+        
+        print(f"\nIP {ip} 测试结果:")
+        print(f"• 成功请求: {success_count}")
+        print(f"• 失败请求: {error_count}")
+        print(f"• 每分钟请求: {requests_per_minute:.1f}")
+        print(f"• 平均延迟: {result['avg_latency']:.1f}ms")
+        
+        return result
+
+    async def run_tests(self):
+        import netifaces
+        ips = []
+        for iface in netifaces.interfaces():
+            addrs = netifaces.ifaddresses(iface)
+            if netifaces.AF_INET in addrs:
+                for addr in addrs[netifaces.AF_INET]:
+                    if addr['addr'] != '127.0.0.1':
+                        ips.append(addr['addr'])
+        
+        print(f"检测到 {len(ips)} 个IP地址")
+        for ip in ips:
+            self.results[ip] = await self.test_single_ip(ip)
+        
+        with open('api_rate_limit_results.json', 'w') as f:
+            json.dump(self.results, f, indent=2)
+        
+        self.analyze_results()
+    
+    def analyze_results(self):
+        print("\n=== 测试结果分析 ===")
+        sorted_results = sorted(
+            self.results.items(),
+            key=lambda x: x[1]['requests_per_minute'],
+            reverse=True
+        )
+        
+        print("\n推荐IP配置:")
+        for ip, result in sorted_results[:3]:
+            print(f"\nIP: {ip}")
+            print(f"• 每分钟请求: {result['requests_per_minute']:.1f}")
+            print(f"• 平均延迟: {result['avg_latency']:.1f}ms")
+            print(f"• 成功率: {(result['success_count']/(result['success_count']+result['error_count'])*100):.1f}%")
+
+async def main():
+    tester = BinanceAPITester()
+    await tester.run_tests()
+
+if __name__ == '__main__':
+    asyncio.run(main())
+EOF
+
+# 创建测试启动脚本
+echo -e "\n${YELLOW}创建测试启动脚本...${NC}"
+cat > run_rate_limit_test.sh << 'EOF'
+#!/bin/bash
+echo "=== 币安API限流测试 ==="
+echo "测试条件:"
+echo "• 目标: 1100请求/分钟/IP"
+echo "• 持续: 60秒"
+echo "• 监控: 延迟和成功率"
+echo -e "\n开始测试..."
+python3 test_api_rate_limit.py
+EOF
+
+chmod +x run_rate_limit_test.sh
+chmod +x test_api_rate_limit.py
+
+# 完成安装
+echo -e "\n${GREEN}环境配置完成!${NC}"
+echo -e "可以运行以下命令进行API测试:"
+echo -e "${YELLOW}./run_rate_limit_test.sh${NC}"
+
+# 在主菜单之前添加所有函数定义
+analyze_ip_characteristics() {
+    local ip=$1
+    echo -e "\n分析 IP: $ip 特征"
+    
+    # 1. 查询IP信息
+    echo "1. IP基本信息:"
+    if ! curl -s "https://ipinfo.io/$ip" | jq . 2>/dev/null; then
+        echo "无法获取IP信息"
+    fi
+    
+    # 2. 查询ASN信息
+    echo -e "\n2. ASN信息:"
+    if command -v whois &> /dev/null; then
+        whois $ip | grep -i "origin\|route" || echo "无ASN信息"
+    else
+        echo "whois命令未安装"
+    fi
+    
+    # 3. 检查TLS指纹
+    echo -e "\n3. TLS指纹:"
+    if command -v openssl &> /dev/null; then
+        echo | openssl s_client -connect api.binance.com:443 -servername api.binance.com 2>/dev/null | openssl x509 -text | grep "Signature Algorithm" || echo "无法获取TLS指纹"
+    else
+        echo "openssl未安装"
+    fi
+    
+    # 4. 测试不同User-Agent
+    echo -e "\n4. 不同User-Agent测试:"
+    local agents=(
+        "Mozilla/5.0"
+        "curl/7.68.0"
+        "Python/3.8"
+        "Binance-Java-SDK"
+    )
+    
+    for agent in "${agents[@]}"; do
+        echo -n "$agent: "
+        if ! curl -s -w "%{time_total}\n" -o /dev/null \
+             -H "User-Agent: $agent" \
+             --interface $ip \
+             https://api.binance.com/api/v3/time 2>/dev/null; then
+            echo "请求失败"
+                fi
+            done
+}
+
+test_ip_identification() {
+    local ip=$1
+    echo -e "\n${YELLOW}===== 测试IP识别机制: $ip =====${NC}"
+    local results=()
+    local detection_points=0
+    
+    echo "1. 基础请求测试"
+    # 1. 基础请求
+    echo -n "  • 普通请求: "
+    local base_latency=$(curl -s -w "%{time_total}" -o /dev/null --interface $ip https://api.binance.com/api/v3/time 2>/dev/null)
+    if [ $? -eq 0 ]; then
+        echo "${base_latency}s"
+        results+=("基础请求成功")
+    else
+        echo "失败"
+        results+=("基础请求失败")
+        detection_points=$((detection_points + 1))
+    fi
+    
+    echo -e "\n2. 请求头测试"
+    # 2. User-Agent测试
+    local agents=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "Binance/2.0"
+        "curl/7.68.0"
+        "Python-urllib/3.8"
+        "okhttp/4.9.0"
+    )
+    
+    echo "  • User-Agent测试:"
+    for agent in "${agents[@]}"; do
+        echo -n "    - $agent: "
+        local ua_latency=$(curl -s -w "%{time_total}" -o /dev/null \
+            -H "User-Agent: $agent" \
+            --interface $ip \
+            https://api.binance.com/api/v3/time 2>/dev/null)
+        if [ $? -eq 0 ]; then
+            echo "${ua_latency}s"
+            # 检查延迟差异
+            if (( $(echo "$ua_latency > $base_latency * 1.5" | bc -l) )); then
+                results+=("User-Agent '$agent' 可能被标记")
+                detection_points=$((detection_points + 1))
+            fi
+        else
+            echo "被拒绝"
+            results+=("User-Agent '$agent' 被拒绝")
+            detection_points=$((detection_points + 2))
+        fi
+    done
+    
+    echo -e "\n3. 请求频率测试"
+    # 3. 频率测试
+    echo "  • 快速请求测试:"
+    local success=0
+    local total=10
+    for ((i=1; i<=total; i++)); do
+        if curl -s --interface $ip https://api.binance.com/api/v3/time >/dev/null 2>&1; then
+            success=$((success + 1))
+        fi
+        sleep 0.1
+    done
+    echo "    - 成功率: $success/$total"
+    if [ $success -lt $total ]; then
+        results+=("检测到频率限制")
+        detection_points=$((detection_points + 2))
+    fi
+    
+    echo -e "\n4. 协议特征测试"
+    # 4. TLS指纹测试
+    echo -n "  • TLS指纹: "
+    if openssl s_client -connect api.binance.com:443 -servername api.binance.com \
+        -cipher 'ECDHE-RSA-AES128-GCM-SHA256' >/dev/null 2>&1; then
+        echo "标准"
+    else
+        echo "异常"
+        results+=("TLS指纹异常")
+        detection_points=$((detection_points + 2))
+    fi
+    
+    # 5. 代理检测测试
+    echo -e "\n5. 代理特征测试"
+    echo -n "  • 代理头部检测: "
+    local proxy_test=$(curl -s -w "%{http_code}" -o /dev/null \
+        -H "X-Forwarded-For: 8.8.8.8" \
+        -H "Via: 1.1 proxy" \
+        --interface $ip \
+        https://api.binance.com/api/v3/time 2>/dev/null)
+    if [ "$proxy_test" = "200" ]; then
+        echo "未检测"
+    else
+        echo "被检测 (状态码: $proxy_test)"
+        results+=("代理特征被检测")
+        detection_points=$((detection_points + 2))
+    fi
+    
+    # 分析结果
+    echo -e "\n${YELLOW}===== 分析结果 =====${NC}"
+    echo "检测分数: $detection_points (0-3:低风险 4-7:中风险 8+:高风险)"
+    echo -e "\n发现的问题:"
+    for result in "${results[@]}"; do
+        echo "• $result"
+    done
+    
+    # 提供建议
+    echo -e "\n${GREEN}===== 伪装建议 =====${NC}"
+    if [ $detection_points -ge 8 ]; then
+        echo "高风险IP，建议采取以下措施："
+        echo "1. 使用动态IP轮换策略"
+        echo "2. 实现完整的浏览器指纹模拟"
+        echo "3. 使用代理链路混淆真实IP"
+        echo "4. 考虑使用住宅IP或数据中心IP混合"
+    elif [ $detection_points -ge 4 ]; then
+        echo "中等风险IP，建议采取以下措施："
+        echo "1. 优化请求头伪装"
+        echo "2. 实现基本的浏览器特征模拟"
+        echo "3. 控制请求频率在安全范围"
+        echo "4. 定期轮换User-Agent"
+    else
+        echo "低风险IP，建议采取以下措施："
+        echo "1. 保持当前配置"
+        echo "2. 定期监控IP状态"
+        echo "3. 建立备用IP池"
+    fi
+    
+    # 具体的伪装方案
+    echo -e "\n${YELLOW}推荐伪装方案：${NC}"
+    cat << EOF
+1. 请求头优化：
+   • User-Agent: $(echo "${agents[0]}")
+   • Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8
+   • Accept-Language: en-US,en;q=0.5
+   • Accept-Encoding: gzip, deflate, br
+   • Connection: keep-alive
+   • Upgrade-Insecure-Requests: 1
+
+2. TLS配置：
+   • 使用主流密码套件
+   • 启用SNI
+   • 使用标准TLS 1.2/1.3协议
+
+3. 请求策略：
+   • 随机化请求间隔 ($(echo "scale=2; $base_latency * 1.5" | bc) - $(echo "scale=2; $base_latency * 2.5" | bc)秒)
+   • 实现退避算法
+   • 错误请求限制在5%以内
+
+4. IP使用建议：
+   • 每个IP限制在$(echo "scale=0; 1000 * $base_latency" | bc)请求/分钟
+   • 超过限制自动切换IP
+   • 建立IP信誉度跟踪系统
+EOF
+    
+    echo -e "\n${YELLOW}是否需要生成伪装配置文件？(y/n)${NC}"
+    read -p "请选择: " gen_config
+    if [[ $gen_config == "y" || $gen_config == "Y" ]]; then
+        cat > "ip_disguise_${ip}.conf" << EOF
+# 币安API访问伪装配置
+# 生成时间: $(date)
+# IP: $ip
+
+[请求头]
+User-Agent = ${agents[0]}
+Accept = text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8
+Accept-Language = en-US,en;q=0.5
+Accept-Encoding = gzip, deflate, br
+Connection = keep-alive
+
+[频率控制]
+最大请求数/分钟 = $(echo "scale=0; 1000 * $base_latency" | bc)
+基础延迟 = $base_latency
+随机延迟范围 = 0.1-0.3
+
+[TLS配置]
+版本 = TLS 1.2, TLS 1.3
+首选密码套件 = ECDHE-RSA-AES128-GCM-SHA256
+启用SNI = true
+
+[IP策略]
+检测分数 = $detection_points
+风险等级 = $([ $detection_points -ge 8 ] && echo "高" || [ $detection_points -ge 4 ] && echo "中" || echo "低")
+建议轮换间隔 = $([ $detection_points -ge 8 ] && echo "1小时" || [ $detection_points -ge 4 ] && echo "4小时" || echo "12小时")
+EOF
+        echo -e "${GREEN}配置文件已生成: ip_disguise_${ip}.conf${NC}"
+    fi
+}
+
+smart_ip_selection() {
+    local test_duration=60  # 测试时长(秒)
+    local test_interval=5   # 测试间隔(秒)
+    declare -A results
+    
+    # 获取所有可用IP
+    local ips=($(ip -4 addr show | grep inet | awk '{print $2}' | cut -d/ -f1 | grep -v "127.0.0.1"))
+    
+    echo "开始智能IP测试..."
+    echo "测试持续时间: ${test_duration}秒"
+    echo "测试间隔: ${test_interval}秒"
+    
+    # 在测试时长内循环测试所有IP
+    local start_time=$(date +%s)
+    while (( $(date +%s) - start_time < test_duration )); do
+        for ip in "${ips[@]}"; do
+            echo -n "测试 $ip: "
+            if latency=$(curl -s -w "%{time_total}" -o /dev/null --interface $ip https://api.binance.com/api/v3/time 2>/dev/null); then
+                echo "${latency}s"
+                results[$ip]+=" $latency"
+            else
+                echo "失败"
+            fi
+        done
+        sleep $test_interval
+    done
+    
+    # 分析结果
+    echo -e "\n=== IP性能分析 ==="
+    for ip in "${ips[@]}"; do
+        echo -e "\nIP: $ip"
+        if [ ! -z "${results[$ip]}" ]; then
+            # 使用awk计算平均值和标准差
+            echo "${results[$ip]}" | awk '
+            BEGIN {sum=0; count=0}
+            {
+                for(i=1;i<=NF;i++) {
+                    sum+=$i; 
+                    sumsq+=$i*$i;
+                    count++
+                }
+            }
+            END {
+                avg=sum/count;
+                stddev=sqrt(sumsq/count - (sum/count)**2);
+                printf "- 平均延迟: %.3fs\n- 延迟波动: %.3fs\n- 样本数量: %d\n", 
+                       avg, stddev, count
+            }'
+        else
+            echo "- 无有效数据"
+        fi
+    done
+}
+
+rotate_ip_strategy() {
+    local ips=("$@")
+    if [ ${#ips[@]} -eq 0 ]; then
+        echo "没有可用的IP地址"
+        return 1
+    fi
+    
+    local current_index=0
+    local rotation_interval=300  # 5分钟轮换一次
+    
+    echo "开始IP轮换测试..."
+    echo "轮换间隔: ${rotation_interval}秒"
+    echo "可用IP数量: ${#ips[@]}"
+    
+    # 显示所有可用IP
+    echo -e "\n可用IP列表:"
+    for ((i=0; i<${#ips[@]}; i++)); do
+        echo "$((i+1)). ${ips[i]}"
+    done
+    
+    echo -e "\n按Ctrl+C停止测试\n"
+    
+    while true; do
+        # 获取当前IP
+        local current_ip=${ips[$current_index]}
+        
+        # 测试当前IP性能
+        echo -n "使用IP: $current_ip - "
+        if perf=$(curl -s -w "%{time_total}" -o /dev/null --interface $current_ip https://api.binance.com/api/v3/time 2>/dev/null); then
+            echo "延迟: ${perf}s"
+            
+            # 如果性能较差，立即切换
+            if (( $(echo "$perf > 0.1" | bc -l) )); then
+                echo "性能不佳，切换IP..."
+                current_index=$(( (current_index + 1) % ${#ips[@]} ))
+                continue
+            fi
+        else
+            echo "请求失败，切换到下一个IP"
+            current_index=$(( (current_index + 1) % ${#ips[@]} ))
+            continue
+        fi
+        
+        echo "等待${rotation_interval}秒后轮换..."
+        sleep $rotation_interval
+        current_index=$(( (current_index + 1) % ${#ips[@]} ))
+    done
+}
+
+# 添加一键测试函数
+run_comprehensive_test() {
+    echo -e "${GREEN}====== 开始全面IP测试与分析 ======${NC}"
+    local report_file="ip_analysis_report_$(date +%Y%m%d_%H%M%S).txt"
+    
+    # 重定向所有输出到报告文件
+    {
+        echo "币安API访问优化报告"
+        echo "生成时间: $(date)"
+        echo "系统信息: $(uname -a)"
+        echo "======================="
+        
+        # 1. 获取所有IP
+        echo -e "\n[1/5] 检测可用IP..."
+        local ips=($(ip -4 addr show | grep inet | awk '{print $2}' | cut -d/ -f1 | grep -v "127.0.0.1"))
+        echo "发现 ${#ips[@]} 个IP地址"
+        
+        # 2. 快速延迟测试
+        echo -e "\n[2/5] 执行延迟测试..."
+        declare -A latency_results
+        for ip in "${ips[@]}"; do
+            local avg_latency=0
+            local success=0
+            for ((i=1; i<=3; i++)); do
+                if latency=$(curl -s -w "%{time_total}" -o /dev/null --interface $ip https://api.binance.com/api/v3/time 2>/dev/null); then
+                    avg_latency=$(echo "$avg_latency + $latency" | bc)
+                    success=$((success + 1))
+                fi
+            done
+            if [ $success -gt 0 ]; then
+                latency_results[$ip]=$(echo "scale=3; $avg_latency / $success" | bc)
+            else
+                latency_results[$ip]="fail"
+            fi
+        done
+        
+        # 3. IP识别测试
+        echo -e "\n[3/5] 执行IP识别测试..."
+        declare -A detection_scores
+        for ip in "${ips[@]}"; do
+            if [ "${latency_results[$ip]}" != "fail" ]; then
+                echo -e "\n测试 IP: $ip"
+                detection_score=0
+                
+                # 基础请求测试
+                base_latency=${latency_results[$ip]}
+                
+                # User-Agent测试
+    local agents=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                    "Binance/2.0"
+        "curl/7.68.0"
+                    "Python-urllib/3.8"
+    )
+    
+    for agent in "${agents[@]}"; do
+                    if ! curl -s -H "User-Agent: $agent" --interface $ip https://api.binance.com/api/v3/time >/dev/null 2>&1; then
+                        detection_score=$((detection_score + 1))
+                    fi
+                done
+                
+                # 频率测试
+                local freq_success=0
+                for ((i=1; i<=5; i++)); do
+                    if curl -s --interface $ip https://api.binance.com/api/v3/time >/dev/null 2>&1; then
+                        freq_success=$((freq_success + 1))
+                    fi
+                    sleep 0.1
+                done
+                if [ $freq_success -lt 5 ]; then
+                    detection_score=$((detection_score + 2))
+                fi
+                
+                detection_scores[$ip]=$detection_score
+            fi
+        done
+        
+        # 4. 限流测试
+        echo -e "\n[4/5] 执行限流测试..."
+        declare -A rate_limits
+        for ip in "${ips[@]}"; do
+            if [ "${latency_results[$ip]}" != "fail" ]; then
+                echo "测试IP: $ip"
+                
+                # 创建临时Python测试脚本
+                cat > "temp_rate_test.py" << 'EOF'
+import asyncio
+import aiohttp
+import time
+from datetime import datetime
+import sys
+import json
+from collections import deque
+
+class RateTest:
+    def __init__(self, ip):
+        self.ip = ip
+        self.success_count = 0
+        self.error_count = 0
+        self.latencies = []
+        self.error_types = {}
+        self.rate_history = deque(maxlen=120)  # 存储2分钟的历史数据
+        self.test_duration = 120  # 测试持续120秒
+        self.concurrent_tasks = 50
+        self.log_file = f"rate_test_{ip}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        
+    def log(self, message):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        log_message = f"[{timestamp}] {message}"
+        print(log_message)
+        with open(self.log_file, "a") as f:
+            f.write(log_message + "\n")
+
+    async def test_rate_limit(self):
+        self.log(f"开始测试IP: {self.ip}")
+        self.log(f"测试时长: {self.test_duration}秒")
+        self.log(f"并发任务数: {self.concurrent_tasks}")
+        
+        start_time = time.time()
+        last_report_time = start_time
+        
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for i in range(self.concurrent_tasks):
+                tasks.append(asyncio.create_task(
+                    self.make_requests(session, start_time, i)
+                ))
+            
+            # 监控任务
+            tasks.append(asyncio.create_task(
+                self.monitor_progress(start_time)
+            ))
+            
+            await asyncio.gather(*tasks)
+        
+        # 生成最终报告
+        self.generate_final_report()
+
+    async def make_requests(self, session, start_time, task_id):
+        while time.time() - start_time < self.test_duration:
+            try:
+                req_start = time.time()
+                async with session.get(
+                    'https://api.binance.com/api/v3/time',
+                    headers={
+                        'Content-Type': 'application/json',
+                        'User-Agent': f'RateTest/1.0 Task/{task_id}',
+                    },
+                    timeout=2
+                ) as response:
+                    await response.json()
+                    latency = (time.time() - req_start) * 1000
+                    self.latencies.append(latency)
+                    self.success_count += 1
+                    
+            except Exception as e:
+                self.error_count += 1
+                error_type = type(e).__name__
+                self.error_types[error_type] = self.error_types.get(error_type, 0) + 1
+            
+            await asyncio.sleep(0.01)  # 避免过度请求
+
+    async def monitor_progress(self, start_time):
+        last_success = 0
+        last_check_time = start_time
+        
+        while time.time() - start_time < self.test_duration:
+            await asyncio.sleep(1)  # 每秒更新一次状态
+            current_time = time.time()
+            time_passed = current_time - last_check_time
+            success_delta = self.success_count - last_success
+            
+            # 计算当前速率
+            current_rate = success_delta / time_passed * 60
+            self.rate_history.append(current_rate)
+            
+            # 计算平均延迟
+            recent_latencies = self.latencies[-1000:] if self.latencies else []
+            avg_latency = sum(recent_latencies) / len(recent_latencies) if recent_latencies else 0
+            
+            # 记录状态
+            self.log(
+                f"状态更新:\n"
+                f"  时间: {int(current_time - start_time)}s/{self.test_duration}s\n"
+                f"  当前速率: {current_rate:.1f} 请求/分钟\n"
+                f"  平均延迟: {avg_latency:.2f}ms\n"
+                f"  成功请求: {self.success_count}\n"
+                f"  失败请求: {self.error_count}\n"
+                f"  成功率: {(self.success_count/(self.success_count+self.error_count)*100):.2f}%"
+            )
+            
+            last_success = self.success_count
+            last_check_time = current_time
+
+    def generate_final_report(self):
+        test_duration = len(self.rate_history)
+        avg_rate = sum(self.rate_history) / len(self.rate_history) if self.rate_history else 0
+        max_rate = max(self.rate_history) if self.rate_history else 0
+        min_rate = min(self.rate_history) if self.rate_history else 0
+        
+        report = {
+            "ip": self.ip,
+            "test_duration": test_duration,
+            "total_requests": self.success_count + self.error_count,
+            "success_count": self.success_count,
+            "error_count": self.error_count,
+            "success_rate": (self.success_count/(self.success_count+self.error_count)*100) if (self.success_count+self.error_count) > 0 else 0,
+            "average_rate": avg_rate,
+            "max_rate": max_rate,
+            "min_rate": min_rate,
+            "rate_stability": (max_rate - min_rate) / avg_rate if avg_rate > 0 else 0,
+            "average_latency": sum(self.latencies) / len(self.latencies) if self.latencies else 0,
+            "error_types": self.error_types,
+            "rate_history": list(self.rate_history)
+        }
+        
+        # 保存详细报告
+        report_file = f"rate_test_report_{self.ip}.json"
+        with open(report_file, "w") as f:
+            json.dump(report, f, indent=2)
+        
+        # 输出摘要
+        self.log("\n========== 测试报告 ==========")
+        self.log(f"IP地址: {self.ip}")
+        self.log(f"测试时长: {test_duration}秒")
+        self.log(f"总请求数: {report['total_requests']}")
+        self.log(f"成功请求: {report['success_count']}")
+        self.log(f"失败请求: {report['error_count']}")
+        self.log(f"成功率: {report['success_rate']:.2f}%")
+        self.log(f"平均速率: {report['average_rate']:.1f} 请求/分钟")
+        self.log(f"最大速率: {report['max_rate']:.1f} 请求/分钟")
+        self.log(f"最小速率: {report['min_rate']:.1f} 请求/分钟")
+        self.log(f"速率稳定性: {report['rate_stability']:.2f}")
+        self.log(f"平均延迟: {report['average_latency']:.2f}ms")
+        self.log("\n错误类型统计:")
+        for error_type, count in report['error_types'].items():
+            self.log(f"  {error_type}: {count}")
+        self.log("\n详细报告已保存到: " + report_file)
+        
+        # 返回平均速率用于主程序
+        print(f"{report['average_rate']}")
+
+async def main():
+    ip = sys.argv[1]
+    tester = RateTest(ip)
+    await tester.test_rate_limit()
+
+if __name__ == '__main__':
+    asyncio.run(main())
+EOF
+        
+        # 运行Python测试脚本
+        echo -e "\n开始测试IP: $ip"
+        rate=$(python3 temp_rate_test.py "$ip")
+        rate_limits[$ip]=${rate%.*}  # 取整数部分
+        
+        echo -e "\n${GREEN}IP $ip 测试完成${NC}"
+        echo "平均请求率: ${rate_limits[$ip]} 请求/分钟"
+        echo "详细日志已保存到 rate_test_${ip}_*.log"
+        echo "完整报告已保存到 rate_test_report_${ip}.json"
+        echo -e "----------------------------------------\n"
+        
+        # 清理临时文件
+        rm temp_rate_test.py
+        fi
+    done
+    
+# ... 保持后面的代码不变 ...
+} | tee "$report_file"
+    
+    echo -e "\n${GREEN}测试完成！详细报告已保存到: $report_file${NC}"
+    echo -e "${YELLOW}建议查看报告了解详细的优化建议${NC}"
+}
+
+# 主菜单
 while true; do
-    clear
     echo """
 ====== 币安现货抢币工具 ======
 1. 检查系统环境
 2. 安装/更新依赖
 3. 测试API延迟
-4. 安装系统服务
-5. 立即运行程序（前端运行）
-6. 后台运行程序（后台持续运行）
+4. API限流测试(1100/分钟)
+5. 安装系统服务
+6. 立即运行程序
 7. 查看运行日志
-8. 重新连接抢购界面（断线重连）
-9. 同步系统时间到UTC+8
-10. 多IP管理
-0. 退出安装脚本
+8. 同步系统时间
+9. IP特征分析与测试
+0. 退出
 ============================
 """
-    read -p "请选择操作 (0-10): " choice
+    read -p "请选择操作 (0-9): " choice
     case $choice in
-        1)
-            check_dependencies
-            ;;
-        2)
-            install_dependencies
-            ;;
-        3)
-            test_binance_latency
+        9)
+            while true; do
+                echo """
+====== IP特征分析与测试 ======
+1. 分析所有IP特征
+2. 测试IP识别机制
+3. 智能IP测试
+4. IP轮换测试
+5. 一键优化测试
+6. 返回主菜单
+============================
+"""
+                read -p "请选择测试类型 (1-6): " test_choice
+                case $test_choice in
+                    1)
+                        echo "开始分析所有IP特征..."
+                        for ip in $(ip -4 addr show | grep inet | awk '{print $2}' | cut -d/ -f1 | grep -v "127.0.0.1"); do
+                            analyze_ip_characteristics "$ip"
+                        done
+                        ;;
+                    2)
+                        echo "开始测试IP识别机制..."
+                        for ip in $(ip -4 addr show | grep inet | awk '{print $2}' | cut -d/ -f1 | grep -v "127.0.0.1"); do
+                            test_ip_identification "$ip"
+                        done
+                        ;;
+                    3)
+                        echo "开始智能IP测试..."
+                        smart_ip_selection
+                        ;;
+                    4)
+                        echo "开始IP轮换测试..."
+                        IPS=($(ip -4 addr show | grep inet | awk '{print $2}' | cut -d/ -f1 | grep -v "127.0.0.1"))
+                        rotate_ip_strategy "${IPS[@]}"
+                        ;;
+                    5)
+                        run_comprehensive_test
+                        ;;
+                    6)
+                        break
+                        ;;
+                    *)
+                        echo "无效选项"
+                        ;;
+                esac
+                read -p "按回车键继续..."
+            done
             ;;
         4)
-            install_service
-            ;;
-        5)
-            if [ ! -f "binance_sniper.py" ]; then
-                echo "错误: 主程序不存在"
-                read -p "按回车键继续..."
-                continue
+            echo "开始API限流测试..."
+            if [ ! -f "test_api_rate_limit.py" ]; then
+                echo -e "${RED}未找到测试脚本，重新创建...${NC}"
+                # 创建API限流测试脚本
+                cat > test_api_rate_limit.py << 'EOF'
+# ... Python脚本内容 ...
+EOF
+                
+                # 创建启动脚本
+                cat > run_rate_limit_test.sh << 'EOF'
+#!/bin/bash
+echo "=== 币安API限流测试 ==="
+echo "测试条件:"
+echo "• 目标: 1100请求/分钟/IP"
+echo "• 持续: 60秒"
+echo "• 监控: 延迟和成功率"
+echo -e "\n开始测试..."
+python3 test_api_rate_limit.py
+EOF
+                
+                chmod +x run_rate_limit_test.sh
+                chmod +x test_api_rate_limit.py
             fi
-            python3 binance_sniper.py
-            ;;
-        6)
-            if [ ! -f "binance_sniper.py" ]; then
-                echo "错误: 主程序不存在"
-                read -p "按回车键继续..."
-                continue
-            fi
-
-            # 检查 screen 是否安装
-            if ! command -v screen &> /dev/null; then
-                echo "正在安装 screen..."
-                sudo apt-get update && sudo apt-get install -y screen || {
-                    echo "screen 安装失败，无法使用后台运行功能"
-                    read -p "按回车键继续..."
-                    continue
-                }
-            fi
-
-            # 检查已存在的 screen 会话
-            if screen -ls | grep -q "sniper"; then
-                echo "发现已存在的后台会话，是否重新连接? (y/n)"
-                read -p "请选择: " reconnect_choice
-                if [[ $reconnect_choice == "y" || $reconnect_choice == "Y" ]]; then
-                    screen -r sniper
-                    continue
-                else
-                    echo "是否结束已存在的会话并重新启动? (y/n)"
-                    read -p "请选择: " restart_choice
-                    if [[ $restart_choice == "y" || $restart_choice == "Y" ]]; then
-                        screen -X -S sniper quit
-                    else
-                        continue
-                    fi
-                fi
-            fi
-
-            echo """
-=== 后台运行说明 ===
-1. 程序会在前台启动，您可以进行设置
-2. 即使SSH意外断开，程序也会继续在后台运行
-3. 重新连接服务器后，使用 screen -r sniper 可以重新查看程序
-4. 主动退出请在程序中选择0退出
-5. 临时退出screen会话请按 Ctrl+A+D
-"""
-            read -p "按回车键开始运行..."
             
-            # 启动新的 screen 会话
-            screen -dmS sniper
-            screen -S sniper -X stuff "python3 binance_sniper.py\n"
-            screen -r sniper
-            ;;
-        7)
-            if [ -f "/var/log/binance-sniper/output.log" ]; then
-                tail -f /var/log/binance-sniper/output.log
-            else
-                echo "错误: 日志文件不存在"
+            # 检查Python依赖
+            echo "检查Python依赖..."
+            pip3 install -q aiohttp netifaces || {
+                echo -e "${RED}安装依赖失败${NC}"
                 read -p "按回车键继续..."
-            fi
-            ;;
-        8)
-            echo "正在检查运行中的程序..."
-            if screen -ls | grep -q "sniper"; then
-                echo "发现运行中的程序，正在重新连接..."
-                # 先尝试分离可能存在的其他连接
-                screen -d sniper 2>/dev/null
-                # 重新连接到会话
-                screen -r sniper
+                continue
+            }
+            
+            # 运行测试
+            echo -e "\n${GREEN}开始运行API限流测试...${NC}"
+            ./run_rate_limit_test.sh
+            
+            # 显示结果
+            if [ -f "api_rate_limit_results.json" ]; then
+                echo -e "\n${GREEN}测试完成！详细结果已保存到 api_rate_limit_results.json${NC}"
+                echo "是否查看结果摘要？(y/n)"
+                read -p "请选择: " view_choice
+                if [[ $view_choice == "y" || $view_choice == "Y" ]]; then
+                    jq -r '.[] | "IP: \(.ip)\n请求率: \(.requests_per_minute)次/分钟\n平均延迟: \(.avg_latency)ms\n成功率: \(.success_rate)%\n"' api_rate_limit_results.json
+                fi
             else
-                echo "未发现运行中的程序!"
-                echo "请先使用选项6启动程序"
-                read -p "按回车键继续..."
+                echo -e "${RED}测试可能未完成或发生错误${NC}"
             fi
-            ;;
-        9)
-            sync_system_time
+            
             read -p "按回车键继续..."
             ;;
-        10)
-            configure_multiple_ips
-            ;;
         0)
-            echo "退出安装脚本"
-            exit $SUCCESS
+            echo "退出程序"
+            exit 0
             ;;
         *)
-            echo "无效选项，请重新选择"
-            sleep 1
+            echo "无效选项"
             ;;
     esac
 done
-
-exit $SUCCESS
