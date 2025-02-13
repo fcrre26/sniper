@@ -2158,53 +2158,17 @@ while true; do
 """
     read -p "请选择操作 (0-9): " choice
     case $choice in
-        9)
-            while true; do
-                echo """
-====== IP特征分析与测试 ======
-1. 分析所有IP特征
-2. 测试IP识别机制
-3. 智能IP测试
-4. IP轮换测试
-5. 一键优化测试
-6. 返回主菜单
-============================
-"""
-                read -p "请选择测试类型 (1-6): " test_choice
-                case $test_choice in
-                    1)
-                        echo "开始分析所有IP特征..."
-                        for ip in $(ip -4 addr show | grep inet | awk '{print $2}' | cut -d/ -f1 | grep -v "127.0.0.1"); do
-                            analyze_ip_characteristics "$ip"
-                        done
-                        ;;
-                    2)
-                        echo "开始测试IP识别机制..."
-                        for ip in $(ip -4 addr show | grep inet | awk '{print $2}' | cut -d/ -f1 | grep -v "127.0.0.1"); do
-                            test_ip_identification "$ip"
-                        done
-                        ;;
-                    3)
-                        echo "开始智能IP测试..."
-                        smart_ip_selection
-                        ;;
-                    4)
-                        echo "开始IP轮换测试..."
-                        IPS=($(ip -4 addr show | grep inet | awk '{print $2}' | cut -d/ -f1 | grep -v "127.0.0.1"))
-                        rotate_ip_strategy "${IPS[@]}"
-                        ;;
-                    5)
-                        run_comprehensive_test
-                        ;;
-                    6)
-                        break
-                        ;;
-                    *)
-                        echo "无效选项"
-                        ;;
-                esac
-                read -p "按回车键继续..."
-            done
+        1)
+            echo "检查系统环境..."
+            check_dependencies
+            ;;
+        2)
+            echo "安装/更新依赖..."
+            install_dependencies
+            ;;
+        3)
+            echo "测试API延迟..."
+            test_binance_latency
             ;;
         4)
             echo "开始API限流测试..."
@@ -2257,12 +2221,93 @@ EOF
             
             read -p "按回车键继续..."
             ;;
+        5)
+            echo "安装系统服务..."
+            install_service
+            ;;
+        6)
+            echo "立即运行程序..."
+            if [ -f "binance_sniper.py" ]; then
+                python3 binance_sniper.py
+            else
+                echo -e "${RED}未找到主程序文件${NC}"
+                echo "是否下载主程序？(y/n)"
+                read -p "请选择: " download_choice
+                if [[ $download_choice == "y" || $download_choice == "Y" ]]; then
+                    download_main_program
+                    if [ $? -eq 0 ]; then
+                        python3 binance_sniper.py
+                    fi
+                fi
+            fi
+            ;;
+        7)
+            echo "查看运行日志..."
+            if [ -d "logs" ]; then
+                tail -f logs/binance_sniper.log
+            else
+                echo -e "${RED}未找到日志目录${NC}"
+            fi
+            ;;
+        8)
+            echo "同步系统时间..."
+            sync_system_time
+            ;;
+        9)
+            while true; do
+                echo """
+====== IP特征分析与测试 ======
+1. 分析所有IP特征
+2. 测试IP识别机制
+3. 智能IP测试
+4. IP轮换测试
+5. 一键优化测试
+6. 返回主菜单
+============================
+"""
+                read -p "请选择测试类型 (1-6): " test_choice
+                case $test_choice in
+                    1)
+                        echo "开始分析所有IP特征..."
+                        for ip in $(ip -4 addr show | grep inet | awk '{print $2}' | cut -d/ -f1 | grep -v "127.0.0.1"); do
+                            analyze_ip_characteristics "$ip"
+                        done
+                        ;;
+                    2)
+                        echo "开始测试IP识别机制..."
+                        for ip in $(ip -4 addr show | grep inet | awk '{print $2}' | cut -d/ -f1 | grep -v "127.0.0.1"); do
+                            test_ip_identification "$ip"
+                        done
+                        ;;
+                    3)
+                        echo "开始智能IP测试..."
+                        smart_ip_selection
+                        ;;
+                    4)
+                        echo "开始IP轮换测试..."
+                        IPS=($(ip -4 addr show | grep inet | awk '{print $2}' | cut -d/ -f1 | grep -v "127.0.0.1"))
+                        rotate_ip_strategy "${IPS[@]}"
+                        ;;
+                    5)
+                        run_comprehensive_test
+                        ;;
+                    6)
+                        break
+                        ;;
+                    *)
+                        echo "无效选项"
+                        ;;
+                esac
+                read -p "按回车键继续..."
+            done
+            ;;
         0)
             echo "退出程序"
             exit 0
             ;;
         *)
-            echo "无效选项"
+            echo -e "${RED}无效选项${NC}"
+            sleep 1
             ;;
     esac
 done
