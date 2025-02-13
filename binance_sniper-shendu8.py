@@ -44,6 +44,7 @@ import socket
 import subprocess
 import netifaces
 import websockets
+import random
 
 # 获取当前脚本所在目录
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1459,6 +1460,24 @@ class BinanceSniper:
             'has_orderbook': False,
             'has_trades': False,
             'last_update': 0
+        }
+
+        # 统一消息队列
+        self.message_queue = asyncio.Queue()
+        self.message_handlers = {
+            'http_response': self._handle_http_response,
+            'ws_message': self._handle_ws_message,
+            'error': self._handle_error,
+            'system': self._handle_system_message
+        }
+        
+        # 消息统计
+        self.message_stats = {
+            'http_count': 0,
+            'ws_count': 0,
+            'error_count': 0,
+            'last_message_time': defaultdict(float),
+            'latencies': defaultdict(list)
         }
 
     def _init_basic_components(self):
@@ -5688,6 +5707,184 @@ class BinanceSniper:
                 self.logger.error(f"测试执行失败: {str(e)}", exc_info=True)
                 input("\n按Enter继续...")
 
+    async def _process_message_queue(self):
+        """统一的消息处理循环"""
+        while True:
+            try:
+                message = await self.message_queue.get()
+                message_type = message.get('type')
+                source = message.get('source')
+                data = message.get('data')
+                timestamp = message.get('timestamp', time.time())
+
+                # 更新统计信息
+                self.message_stats['last_message_time'][source] = timestamp
+                if 'latency' in message:
+                    self.message_stats['latencies'][source].append(message['latency'])
+
+                # 根据消息类型调用对应的处理函数
+                if message_type in self.message_handlers:
+                    await self.message_handlers[message_type](message)
+                
+                # 更新计数器
+                if message_type == 'http_response':
+                    self.message_stats['http_count'] += 1
+                elif message_type == 'ws_message':
+                    self.message_stats['ws_count'] += 1
+                elif message_type == 'error':
+                    self.message_stats['error_count'] += 1
+
+            except Exception as e:
+                logger.error(f"消息处理错误: {str(e)}")
+            finally:
+                self.message_queue.task_done()
+
+    async def _handle_http_response(self, message):
+        """处理HTTP响应"""
+        try:
+            ip = message['source']
+            data = message['data']
+            
+            if message.get('status') == 'success':
+                # 处理成功的响应
+                if 'price' in data:
+                    await self._update_price(data['price'])
+                elif 'depth' in data:
+                    await self._update_depth(data['depth'])
+            else:
+                # 处理错误响应
+                await self._handle_error(message)
+        except Exception as e:
+            logger.error(f"HTTP响应处理错误: {str(e)}")
+
+    async def _handle_ws_message(self, message):
+        """处理WebSocket消息"""
+        try:
+            data = message['data']
+            if 'e' in data:  # 币安事件消息
+                event_type = data['e']
+                if event_type == 'trade':
+                    await self._handle_trade(data)
+                elif event_type == 'depth':
+                    await self._handle_depth(data)
+                elif event_type == 'bookTicker':
+                    await self._handle_book_ticker(data)
+        except Exception as e:
+            logger.error(f"WebSocket消息处理错误: {str(e)}")
+
+    async def _handle_error(self, message):
+        """处理错误消息"""
+        error_type = message.get('error_type', 'unknown')
+        source = message.get('source', 'unknown')
+        error_msg = message.get('data', 'No error message')
+        
+        logger.error(f"错误消息 ({source}): {error_type} - {error_msg}")
+        
+        # 根据错误类型采取相应措施
+        if error_type == 'connection':
+            await self._handle_connection_error(source)
+        elif error_type == 'rate_limit':
+            await self._handle_rate_limit(source)
+        elif error_type == 'market':
+            await self._handle_market_error(source)
+
+    async def _handle_system_message(self, message):
+        """处理系统消息"""
+        if message.get('action') == 'status_update':
+            await self._update_system_status(message['data'])
+        elif message.get('action') == 'config_change':
+            await self._handle_config_change(message['data'])
+
+    # 修改现有的HTTP请求处理
+    async def _make_request(self, ip: str):
+        """发送HTTP请求并将响应放入统一消息队列"""
+        try:
+            req_start = time.time()
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    'https://api.binance.com/api/v3/ticker/24hr',
+                    params={'symbol': self.symbol.replace('/', '')},
+                    headers=self.ip_headers[ip],
+                    timeout=2
+                ) as response:
+                    data = await response.json()
+                    latency = (time.time() - req_start) * 1000
+                    
+                    await self.message_queue.put({
+                        'type': 'http_response',
+                        'source': ip,
+                        'status': 'success',
+                        'data': data,
+                        'timestamp': time.time(),
+                        'latency': latency
+                    })
+        except Exception as e:
+            await self.message_queue.put({
+                'type': 'error',
+                'source': ip,
+                'error_type': type(e).__name__,
+                'data': str(e),
+                'timestamp': time.time()
+            })
+
+    # 修改现有的WebSocket消息处理
+    async def _handle_messages(self, ws, ip: str):
+        """处理WebSocket消息并放入统一消息队列"""
+        try:
+            while True:
+                message = await ws.recv()
+                message_time = time.time()
+                data = json.loads(message)
+                
+                await self.message_queue.put({
+                    'type': 'ws_message',
+                    'source': ip,
+                    'data': data,
+                    'timestamp': message_time,
+                    'latency': (message_time * 1000 - data['E']) if 'E' in data else 0
+                })
+                
+        except Exception as e:
+            await self.message_queue.put({
+                'type': 'error',
+                'source': ip,
+                'error_type': 'websocket_error',
+                'data': str(e),
+                'timestamp': time.time()
+            })
+
+    async def start(self):
+        """启动所有必要的任务"""
+        # 启动消息处理循环
+        self.message_processor = asyncio.create_task(self._process_message_queue())
+        
+        # 启动其他任务...
+        if self.ws_manager:
+            self.ws_monitor = asyncio.create_task(self.ws_manager.monitor_connections())
+        
+        # 启动请求管理器
+        if hasattr(self, 'request_manager'):
+            self.request_processor = asyncio.create_task(self.request_manager.process_responses())
+
+    async def stop(self):
+        """停止所有任务"""
+        if hasattr(self, 'message_processor'):
+            self.message_processor.cancel()
+        if hasattr(self, 'ws_monitor'):
+            self.ws_monitor.cancel()
+        if hasattr(self, 'request_processor'):
+            self.request_processor.cancel()
+        
+        # 等待任务完成
+        pending = [task for task in [
+            getattr(self, 'message_processor', None),
+            getattr(self, 'ws_monitor', None),
+            getattr(self, 'request_processor', None)
+        ] if task is not None]
+        
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
 class ErrorHandler:
     """统一错误处理"""
     def __init__(self):
@@ -6115,6 +6312,100 @@ class ErrorHandler:
         except Exception as e:
             logger.error(f"WebSocket连接失败 (IP: {ip}): {str(e)}")
             return None
+
+class RequestManager:
+    """请求管理器 - 处理请求发送和响应处理"""
+    def __init__(self, symbol: str, logger=None):
+        self.symbol = symbol
+        self.logger = logger or logging.getLogger(__name__)
+        self.response_queue = asyncio.Queue()
+        self.running = True
+        self._message_count = 0
+        self._message_count_lock = asyncio.Lock()
+        
+        # 硬件指纹池
+        self.headers_pool = [
+            {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-arch': '"x86"',
+                'sec-ch-ua-bitness': '"64"'
+            },
+            {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+                'Accept': 'application/json',
+                'Accept-Language': 'en-GB,en-US;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'sec-ch-ua': '"Not_A Brand";v="8", "Chromium";v="120"',
+                'sec-ch-ua-platform': '"macOS"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-arch': '"arm"',
+                'sec-ch-ua-bitness': '"64"'
+            }
+        ]
+        self.last_request_time = {}
+        self.ip_headers = {}  # 每个IP使用固定的headers
+
+    async def send_requests(self, ip: str):
+        """严格按54ms间隔发送请求"""
+        if ip not in self.ip_headers:
+            self.ip_headers[ip] = random.choice(self.headers_pool)
+        
+        while self.running:
+            try:
+                current_time = time.time()
+                if ip in self.last_request_time:
+                    elapsed = current_time - self.last_request_time[ip]
+                    if elapsed < 0.054:  # 54ms
+                        await asyncio.sleep(0.054 - elapsed)
+                
+                # 发送请求，不等待响应
+                asyncio.create_task(self._make_request(ip))
+                self.last_request_time[ip] = time.time()
+                
+            except Exception as e:
+                self.logger.error(f"发送请求失败 (IP: {ip}): {str(e)}")
+                await asyncio.sleep(0.054)
+
+    async def _make_request(self, ip: str):
+        """实际发送请求并将响应放入队列"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    'https://api.binance.com/api/v3/ticker/24hr',
+                    params={'symbol': self.symbol.replace('/', '')},
+                    headers=self.ip_headers[ip],
+                    timeout=2
+                ) as response:
+                    data = await response.json()
+                    await self.response_queue.put((ip, 'success', data))
+        except Exception as e:
+            await self.response_queue.put((ip, 'error', str(e)))
+
+    async def process_responses(self):
+        """处理响应的独立任务"""
+        while self.running:
+            try:
+                ip, status, data = await self.response_queue.get()
+                if status == 'error':
+                    self.logger.error(f"请求错误 (IP: {ip}): {data}")
+                else:
+                    async with self._message_count_lock:
+                        self._message_count += 1
+                    # 处理成功响应...
+            except Exception as e:
+                self.logger.error(f"处理响应失败: {str(e)}")
+            finally:
+                self.response_queue.task_done()
+
+    @property
+    def message_count(self):
+        return self._message_count
 
 # 在文件末尾添加
 async def main():
