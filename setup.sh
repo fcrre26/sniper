@@ -31,7 +31,7 @@ initialize_environment() {
 
     # 2. 安装Python依赖
     echo -e "${YELLOW}安装Python依赖...${NC}"
-    pip3 install ccxt aiohttp websocket-client requests cryptography prometheus_client psutil pytz netifaces websockets
+    pip3 install aiohttp requests websocket-client websockets ccxt pytz netifaces psutil prometheus_client aiofiles
 
     # 3. 创建必要的目录
     echo -e "${YELLOW}创建必要的目录...${NC}"
