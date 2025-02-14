@@ -53,6 +53,7 @@ from aiohttp import ClientSession, ClientTimeout, TCPConnector
 from requests.adapters import HTTPAdapter
 from requests.exceptions import RequestException, Timeout
 from urllib3.util.retry import Retry
+import aiofiles  # 这个包缺失
 
 # 加密和安全
 import hmac
@@ -67,6 +68,8 @@ import pytz
 import netifaces
 import psutil
 import prometheus_client as prom
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Optional, Tuple
 
 # 配置和工具
 import configparser
@@ -580,8 +583,6 @@ class ExecutionStrategyManager:
 # =============================== 
 # 模块：执行策略管理器
 # ===============================
-# 在 SniperError 类定义之后,ExecutionController 类之前添加
-
 class TimeSync:
     """时间同步管理器"""
     def __init__(self):
@@ -605,7 +606,7 @@ class TimeSync:
             logger.error(f"获取服务器时间失败: {str(e)}")
             return None
 
-    async def sync(self) -> bool:  # ✅ 正确声明为异步方法
+    async def sync(self) -> bool:
         """同步时间"""
         try:
             measurements = []
@@ -640,18 +641,18 @@ class TimeSync:
             self._server_time = statistics.median(m['server_time'] for m in filtered)
             self.last_sync_time = self._server_time
             
-            # 修改日志输出，使用本地时间
-            logger.info(f"""
-[时间同步] 
-• 本地时间: {format_local_time(self._server_time)}
+            # 修改日志格式
+            self.logger.info(f"""
+=== 时间同步完成 ===
+• 总耗时: {total_time:.2f}ms
 • 网络延迟: {self.network_latency:.2f}ms
-• 样本数量: {len(filtered)}
+• 时间偏移: {self.server_time_offset:.2f}ms
 """)
             
             return True
             
         except Exception as e:
-            logger.error(f"时间同步失败: {str(e)}")
+            self.logger.error(f"时间同步失败: {str(e)}")
             return False
     
     def get_current_time(self) -> int:
@@ -673,60 +674,10 @@ class TimeSync:
 class MarketDepthAnalyzer:
     """市场深度分析器"""
     def __init__(self):
-        self.session = None
-        self.base_url = 'https://api.binance.com'
-        self.depth_path = '/api/v3/depth'
-        self._cached_params = {}
-        self._connector = None
+        self.logger = logging.getLogger(__name__)
         
-    async def _init_session(self):
-        """初始化会话，优化连接设置"""
-        if self.session is None:
-            # 1. 优化连接设置
-            self._connector = aiohttp.TCPConnector(
-                force_close=False,  # 改为保持连接
-                ttl_dns_cache=300,  # DNS缓存5分钟
-                use_dns_cache=True,
-                limit=1,  # 限制并发连接数为1
-                enable_cleanup_closed=True,  # 自动清理关闭的连接
-                tcp_nodelay=True,  # 启用 TCP_NODELAY
-                keepalive_timeout=30  # 连接保持30秒
-            )
-            
-            # 2. 优化超时设置
-            timeout = aiohttp.ClientTimeout(
-                total=0.5,      # 总超时500ms
-                connect=0.1,    # 连接超时100ms
-                sock_read=0.2   # 读取超时200ms
-            )
-            
-            # 3. 创建会话
-            self.session = aiohttp.ClientSession(
-                connector=self._connector,
-                timeout=timeout,
-                headers={
-                    'Accept': 'application/json',
-                    'User-Agent': 'aiohttp/3.8.1',
-                    'Connection': 'keep-alive'
-                }
-            )
-            
-    def _prepare_params(self, symbol: str, limit: int = 5):
-        """预处理请求参数"""
-        cache_key = f"{symbol}:{limit}"
-        if cache_key not in self._cached_params:
-            self._cached_params[cache_key] = {
-                'symbol': symbol.replace('/', ''),
-                'limit': limit
-            }
-        return self._cached_params[cache_key]
-
-    async def analyze_depth(self, client, symbol: str, limit: int = 5):
-        """分析市场深度"""
+    async def analyze_depth(self, orderbook: dict) -> dict:
         try:
-            await self._init_session()
-            params = self._prepare_params(symbol, limit)
-            
             # 4. 优化请求
             async with self.session.get(
                 f"{self.base_url}{self.depth_path}",
@@ -773,9 +724,9 @@ class MarketDepthAnalyzer:
                 }
                 
         except Exception as e:
-            logger.error(f"分析市场深度失败: {str(e)}")
+            self.logger.error(f"深度分析失败: {str(e)}")
             return None
-            
+
     async def close(self):
         """关闭资源"""
         if self.session:
@@ -900,7 +851,7 @@ class RealTimeMonitor:
                 'Total number of errors'
             )
         }
-        
+
     def record_latency(self, category: str, latency: float):
         """记录延迟"""
         self.metrics[f'{category}_latency'].append(latency)
@@ -1178,9 +1129,6 @@ def format_local_time(timestamp_ms: int) -> str:
     dt = datetime.fromtimestamp(timestamp_ms/1000, timezone)
     return dt.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
 
-# 在导入部分添加
-from .order_processor import OrderProcessor
-
 class BinanceSniper:
     """币安抢币工具核心类"""
     
@@ -1212,200 +1160,124 @@ class BinanceSniper:
     }
     
     def __init__(self, config: ConfigManager):
-        """初始化币安抢币工具
-        Args:
-            config: 配置管理器实例
-        """
-        # 基础配置
-        self.logger = setup_logger()
+        """初始化币安抢币工具"""
         self.config = config
+        self.logger = logging.getLogger(__name__)
         self.trade_client = None
         self.query_client = None
         self.timezone = pytz.timezone('Asia/Shanghai')
         
-        # 执行相关配置
-        self.execution_ips = {}
-        self.ip_roles_locked = False
+        # 修改这行: 使用 PerformanceAnalyzer 替代 PerformanceTimer
+        self.perf = PerformanceAnalyzer()  # 修改这里
         
-        # 市场数据相关
+        # 添加网络和时间相关属性初始化
+        self.network_latency = 0
+        self.server_time_offset = 0
+        
+        # 初始化其他属性
+        self.symbol = None
+        self.amount = None
+        self.max_price_limit = None
+        self.price_multiplier = None
+        self.concurrent_orders = None
+        self.advance_time = None
+        self.stop_loss = None
+        self.sell_strategy = None
+        self.opening_time = None
+        
+        # 确保 DataPool 和 OrderProcessor 在初始化时就创建
         self.data_pool = DataPool()
-        self.market_cache = None
+        self.order_processor = OrderProcessor(config, self.data_pool, self)
         
-        # 性能监控
-        self.perf = PerformanceAnalyzer()
+        # 初始化基本组件
+        self._init_basic_components()
         
-    async def execute_orders_with_strategy(self) -> List[dict]:
-        """使用分批策略执行订单
-        Returns:
-            List[dict]: 成功执行的订单列表
-        """
-        orders = []
-        execution_start = self.get_server_time()
-        
+        # 统一管理市场数据
+        self.market_data = {
+            'network_latency': 0,
+            'time_offset': 0,
+            'server_time': 0,
+            'current_price': 0,
+            'price_24h_change': 0,
+            'volume_24h': 0,
+            'market_status': '未知'
+        }
+    async def update_market_data(self):
+        """更新市场数据"""
         try:
-            # 1. 交易对状态检查
-            status = await self.check_symbol_status()
-            if not status['active']:
-                raise MarketError(f"交易对不可用: {status['msg']}")
-
-            # 2. 三批次执行策略
-            # 第1批: T+0ms (2个订单)
-            self.logger.info("执行第1批订单...")
-            first_batch = await self._execute_batch(
-                batch_size=2,
-                time_offset=0,
-                ip=self.execution_ips['primary']
-            )
-            if first_batch:
-                return first_batch
-
-            # 第2批: T+5ms (2个订单)
-            self.logger.info("执行第2批订单...")
-            second_batch = await self._execute_batch(
-                batch_size=2,
-                time_offset=5,
-                ip=self.execution_ips['secondary']
-            )
-            if second_batch:
-                return second_batch
-
-            # 第3批: T+10ms (1个订单)
-            self.logger.info("执行第3批订单...")
-            final_batch = await self._execute_batch(
-                batch_size=1,
-                time_offset=10,
-                ip=self.execution_ips['fallback']
-            )
-            if final_batch:
-                return final_batch
-
-            total_time = self.get_server_time() - execution_start
-            self.logger.warning(f"所有批次执行完成，总耗时: {total_time}ms，无成功订单")
-            return []
-
-        except Exception as e:
-            self.logger.error(f"订单执行策略失败: {str(e)}")
-            return orders
-
-    async def _execute_batch(self, batch_size: int, time_offset: int, ip: str) -> List[dict]:
-        """执行一批订单
-        Args:
-            batch_size: 订单数量
-            time_offset: 相对于基准时间的偏移(ms)
-            ip: 使用的IP地址
-        Returns:
-            List[dict]: 成功的订单列表
-        """
-        orders = []
-        try:
-            # 计算执行时间
-            base_time = self.get_server_time()
-            execution_time = base_time + time_offset
-
-            # 创建订单任务
-            tasks = []
-            for _ in range(batch_size):
-                tasks.append(self._place_single_order(
-                    ip=ip,
-                    execution_time=execution_time
-                ))
-
-            # 并发执行订单
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            # 更新价格信息
+            if self.query_client:
+                try:
+                    ticker = await self.query_client.fetch_ticker(self.symbol)
+                    self.market_data.update({
+                        'current_price': ticker['last'],
+                        'price_24h_change': ticker['percentage'],
+                        'volume_24h': ticker['quoteVolume'],
+                    })
+                except Exception as e:
+                    self.logger.error(f"获取价格信息失败: {str(e)}")
+                    self.market_data.update({
+                        'market_status': '正常交易'
+                    })
             
-            # 处理结果
-            for result in results:
-                if isinstance(result, Exception):
-                    self.logger.error(f"订单执行失败: {str(result)}")
-                    continue
-                if result and result.get('status') == 'filled':
-                    orders.append(result)
-
-            return orders
-
+            # 更新网络和时间信息
+            time_sync_result = await self.time_sync.sync()
+            if time_sync_result:
+                self.market_data.update({
+                    'network_latency': time_sync_result[0],
+                    'time_offset': time_sync_result[1],
+                    'server_time': time_sync_result[2]
+                })
+                
+            return True
         except Exception as e:
-            self.logger.error(f"批次执行失败: {str(e)}")
-            return orders
-
-    async def _place_single_order(self, ip: str, execution_time: float) -> Optional[dict]:
-        """执行单个订单
-        Args:
-            ip: 使用的IP
-            execution_time: 目标执行时间(ms)
-        Returns:
-            Optional[dict]: 订单结果
-        """
+            self.logger.error(f"更新市场数据失败: {str(e)}")
+            return False
+        
+    async def print_strategy_async(self):
+        """代理到 OrderProcessor 的打印方法"""
         try:
-            # 等待直到执行时间
-            current_time = self.get_server_time()
-            if current_time < execution_time:
-                wait_time = (execution_time - current_time) / 1000
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
-
-            # 准备订单参数
-            order_params = {
-                'symbol': self.symbol,
-                'type': 'LIMIT',
-                'side': 'BUY',
-                'price': self.price,
-                'amount': self.amount,
-                'timeInForce': 'GTC',
-                'timestamp': int(execution_time)
-            }
-
-            # 执行订单
-            start_time = self.get_server_time()
-            order = await self.trade_client.create_order(**order_params)
-            execution_latency = self.get_server_time() - start_time
-
-            # 记录执行延迟
-            self.logger.info(f"订单执行完成 - IP: {ip}, 延迟: {execution_latency}ms")
+            # 更新市场数据
+            await self.update_market_data()
             
-            return order
-
+            # 同步必要的属性到 OrderProcessor
+            self.order_processor.query_client = self.query_client
+            self.order_processor.trade_client = self.trade_client
+            self.order_processor.symbol = self.symbol
+            self.order_processor.amount = self.amount
+            self.order_processor.max_price_limit = self.max_price_limit
+            self.order_processor.price_multiplier = self.price_multiplier
+            self.order_processor.concurrent_orders = self.concurrent_orders
+            self.order_processor.advance_time = self.advance_time
+            self.order_processor.stop_loss = self.stop_loss
+            self.order_processor.sell_strategy = self.sell_strategy
+            self.order_processor.opening_time = self.opening_time
+            
+            # 调用 OrderProcessor 的实现
+            return await self.order_processor.print_strategy_async()
+            
         except Exception as e:
-            await self.ip_manager.report_error(ip)
-            raise ExecutionError(f"订单执行失败: {str(e)}")
+            self.logger.error(f"打印策略失败: {str(e)}")
+            return False
 
-    def get_server_time(self) -> float:
-        """获取当前币安服务器时间(毫秒)"""
-        return time.time() * 1000 + (self.server_time_offset or 0)
-
-    async def get_latest_price(self) -> Optional[float]:
-        """获取最新价格"""
-        return self.data_pool.get_latest_price()
-
-    async def get_market_depth(self, level: int = 20) -> dict:
-        """获取市场深度"""
-        return self.data_pool.get_depth(level)
-
-    async def get_recent_trades(self, limit: int = 100) -> list:
-        """获取最近成交"""
-        return self.data_pool.get_recent_trades(limit)
-
-    async def _check_api_keys(self) -> bool:
-        """检查API密钥是否已配置且有效"""
+    async def load_strategy_async(self) -> bool:
+        """代理到 OrderProcessor 的加载策略方法"""
         try:
-            trade_api_key, trade_api_secret = self.config.get_trade_api_keys()
-            query_api_key, query_api_secret = self.config.get_query_api_keys()
-
-            if not trade_api_key or not trade_api_secret or not query_api_key or not query_api_secret:
-                self.logger.warning("API密钥未完全配置，请检查配置文件")
-                return False
-
-            # 尝试调用一个简单的API端点来验证密钥 (例如 fetch_time)
-            try:
-                await asyncio.to_thread(self.query_client.fetch_time) # 使用 query_client 验证查询密钥
-                await asyncio.to_thread(self.trade_client.fetch_balance) # 使用 trade_client 验证交易密钥
-                self.logger.info("API密钥验证成功")
-                return True
-            except Exception as e:
-                self.logger.error(f"API密钥验证失败: {str(e)}")
-                return False
-
+            result = await self.order_processor.load_strategy_async()
+            if result:  # 如果加载成功，同步属性回来
+                # 从 OrderProcessor 同步属性到 BinanceSniper
+                self.symbol = self.order_processor.symbol
+                self.amount = self.order_processor.amount
+                self.max_price_limit = self.order_processor.max_price_limit
+                self.price_multiplier = self.order_processor.price_multiplier
+                self.concurrent_orders = self.order_processor.concurrent_orders
+                self.advance_time = self.order_processor.advance_time
+                self.stop_loss = self.order_processor.stop_loss
+                self.sell_strategy = self.order_processor.sell_strategy
+                self.opening_time = self.order_processor.opening_time
+            return result
         except Exception as e:
-            self.logger.error(f"检查API密钥时发生异常: {str(e)}")
+            self.logger.error(f"加载策略失败: {str(e)}")
             return False
 
     async def _init_snipe(self) -> bool:
@@ -1461,8 +1333,12 @@ class BinanceSniper:
 
     def __del__(self):
         """析构函数"""
-        if hasattr(self, 'data_pool'):
-            asyncio.create_task(self.cleanup())
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self.cleanup())
+        except Exception:
+            pass  # 忽略清理过程中的错误
 
     def _init_basic_components(self):
         """初始化基本组件，包括API客户端和连接池"""
@@ -1550,36 +1426,45 @@ class BinanceSniper:
             await self.stop_market_cache()
         
     async def _init_clients(self) -> bool:
-        """异步初始化客户端"""
+        """初始化API客户端"""
         try:
             # 获取API密钥
             trade_api_key, trade_api_secret = self.config.get_trade_api_keys()
             query_api_key, query_api_secret = self.config.get_query_api_keys()
-
-            # 异步初始化客户端
-            self.trade_client = await self._create_async_client(trade_api_key, trade_api_secret)
-            self.query_client = await self._create_async_client(query_api_key, query_api_secret)
             
-            # 验证交易对设置
-            if not self.symbol:
-                raise ConfigError("未设置交易对，请先配置策略")
+            if not (trade_api_key and trade_api_secret and query_api_key and query_api_secret):
+                self.logger.warning("API密钥未配置")
+                return False
+                
+            # 创建客户端
+            self.trade_client = self._create_ccxt_client(trade_api_key, trade_api_secret)
+            self.query_client = self._create_ccxt_client(query_api_key, query_api_secret)
             
             return True
-        
+            
         except Exception as e:
-            logger.error(f"客户端初始化失败: {str(e)}")
+            self.logger.error(f"初始化客户端失败: {str(e)}")
             return False
-
-    def setup_api_keys(self) -> bool:  # 同步方法
-        """设置API密钥"""
+    async def setup_api_keys_async(self):
+        """异步设置API密钥"""
         try:
             print("\n=== API密钥设置 ===")
             
             # 检查是否已有API配置
-            if self.trade_client and self.query_client:
+            if self.config.has_api_keys():
+                print("\n检测到已有API配置,正在测试连接...")
                 try:
-                    print("\n正在测试现有API连接...")
-                    # ... 其他代码保持不变 ...
+                    # 测试交易API
+                    await asyncio.to_thread(self.trade_client.fetch_balance)
+                    print("✅ 交易API连接正常")
+                    
+                    # 测试查询API
+                    start_time = time.time()
+                    await asyncio.to_thread(self.query_client.fetch_time)
+                    latency = (time.time() - start_time) * 1000
+                    print(f"✅ 查询API连接正常 (延迟: {latency:.2f}ms)")
+                    
+                    # 询问是否要更换
                     change = input("\n是否要更换API密钥? (y/n): ").strip().lower()
                     if change != 'y':
                         print("\nAPI设置未变更")
@@ -1587,12 +1472,42 @@ class BinanceSniper:
                 except Exception as e:
                     print(f"\n⚠️ 现有API测试失败: {str(e)}")
             
-            # ... 其他代码保持不变 ...
+            # 设置新的API密钥
+            print("\n请输入新的API密钥:")
+            trade_key = input("交易API Key: ").strip()
+            trade_secret = input("交易API Secret: ").strip()
+            query_key = input("查询API Key: ").strip()
+            query_secret = input("查询API Secret: ").strip()
+            
+            # 保存API密钥
+            self.config.set_trade_api_keys(trade_key, trade_secret)
+            self.config.set_query_api_keys(query_key, query_secret)
+            
+            print("\n✅ API密钥已保存")
+            
+            # 重新初始化客户端并测试
+            if await self._init_clients():
+                print("\n正在测试新API连接...")
+                try:
+                    # 测试交易API
+                    await asyncio.to_thread(self.trade_client.fetch_balance)
+                    print("✅ 交易API连接正常")
+                    
+                    # 测试查询API
+                    start_time = time.time()
+                    await asyncio.to_thread(self.query_client.fetch_time)
+                    latency = (time.time() - start_time) * 1000
+                    print(f"✅ 查询API连接正常 (延迟: {latency:.2f}ms)")
+                except Exception as e:
+                    print(f"❌ API测试失败: {str(e)}")
+            else:
+                print("❌ API客户端初始化失败")
+            
             return True
             
         except Exception as e:
-            logger.error(f"API设置失败: {str(e)}")
-            print(f"\n❌ API设置失败: {str(e)}")
+            self.logger.error(f"设置API密钥失败: {str(e)}")
+            print(f"\n❌ 设置失败: {str(e)}")
             return False
 
     def _init_trading_components(self):
@@ -1601,22 +1516,12 @@ class BinanceSniper:
             raise ValueError("请先设置API密钥")
 
         # 初始化其他组件
-        self.time_sync = TimeSync()
-        self.execution_controller = ExecutionController(
-            time_sync=self.time_sync,
-            order_executor=self.order_executor,
-            depth_analyzer=self.depth_analyzer,
-            monitor=self.monitor
-        )
-        self.network_optimizer = NetworkOptimizer()
-        self.monitor = RealTimeMonitor()
-
-        # 设置时区 (已在文件开头设置，此处可以删除重复设置)
-        # self.timezone = pytz.timezone('Asia/Shanghai')
-
-        # 初始化连接池 (移动到 _init_basic_components)
-        # self._init_connection_pools()
-
+        self.time_sync = TimeSync()  # 已定义的时间同步类
+        self.ip_manager = IPManager()  # 替代 NetworkOptimizer
+        self.data_pool = DataPool()    # 数据池
+        self.order_processor = OrderProcessor(self.config, self.data_pool)  # 订单处理器
+        self.monitor = RealTimeMonitor()  # 监控器
+        
     def _setup_clients(self):
         """设置交易和查询客户端"""
         # 获取两组API密钥
@@ -1803,17 +1708,18 @@ class BinanceSniper:
             self.network_latency = best_measurement['latency']
             self.time_offset = best_measurement['offset']
             
-            logger.info(f"""
+            # 修改日志格式
+            self.logger.info(f"""
 === 时间同步完成 ===
-网络延迟: {self.network_latency:.3f}ms
-时间偏移: {self.time_offset:.3f}ms
-样本数量: {len(filtered)}
+• 总耗时: {total_time:.2f}ms
+• 网络延迟: {self.network_latency:.2f}ms
+• 时间偏移: {self.server_time_offset:.2f}ms
 """)
             
             return self.network_latency, self.time_offset
             
         except Exception as e:
-            logger.error(f"时间同步失败: {str(e)}")
+            self.logger.error(f"时间同步失败: {str(e)}")
             return None
 
     def _filter_measurements(self, measurements: List[Dict]) -> List[Dict]:
@@ -1944,7 +1850,7 @@ class BinanceSniper:
 类型: 市价单
 数量: {self.amount}
 """)
-            return {
+        return {
                 'id': 'test_order_' + str(int(time.time())),
                 'status': 'closed',
                 'filled': self.amount,
@@ -2339,6 +2245,7 @@ class BinanceSniper:
                         market_data_list.append(market_data)
                 except Exception as e:
                     logger.error(f"获取市场数据失败: {str(e)}")
+                    continue
                 
                 # 尽可能快速地继续请求
                 time.sleep(0.001)  # 1ms的最小间隔
@@ -2643,7 +2550,6 @@ class BinanceSniper:
 当前服务器时间: {server_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)
 距离开盘: {time_diff.total_seconds()/3600:.1f}小时
 """)
-
     async def cleanup(self) -> None:
         """清理资源"""
         try:
@@ -2691,7 +2597,7 @@ class BinanceSniper:
                     logger.error(f"保存配置失败: {str(e)}")
             
             logger.info("资源清理完成")
-            
+
         except Exception as e:
             logger.error(f"清理资源失败: {str(e)}")
 
@@ -2869,7 +2775,7 @@ class BinanceSniper:
             
             sync_time = self.perf.stop('final_sync')
             logger.info(f"""
-最终时间同步完成: {sync_time:.2f}ms
+f"最终时间同步完成: {sync_time:.2f}ms"  # 正确：整个字符串在引号内
 - 网络延迟: {best_latency:.2f}ms
 - 时间偏移: {avg_offset:.2f}ms
 """)
@@ -3436,16 +3342,18 @@ class BinanceSniper:
 - 数据处理时间: 5ms
 总提前量: {fetch_advance:.2f}ms
 """)
-        
         return fetch_time
-
-    def _fetch_market_data(self) -> Optional[Dict]:
-        """获取市场数据
-        Returns:
-            Optional[Dict]: 市场数据或None
-        """
+    
+    async def _fetch_market_data(self) -> Optional[Dict]:
+        """获取市场数据"""
         try:
-            depth = self.query_client.fetch_order_book(self.symbol, limit=5)
+            # 使用 await 正确获取订单簿数据
+            depth = await asyncio.to_thread(
+                self.query_client.fetch_order_book,
+                self.symbol,
+                limit=5
+            )
+            
             if not depth or not depth.get('asks') or not depth.get('bids'):
                 return None
                 
@@ -3459,14 +3367,13 @@ class BinanceSniper:
             return market_data
             
         except Exception as e:
-            logger.error(f"获取市场数据失败: {str(e)}")
+            self.logger.error(f"获取市场数据失败: {str(e)}")
             return None
 
     async def _execute_order_async(self, params: Dict) -> Optional[Dict]:
         """异步执行订单"""
         try:
             async with aiohttp.ClientSession() as session:
-                # 使用预签名的参数
                 async with session.post(
                     'https://api.binance.com/api/v3/order',
                     headers={'X-MBX-APIKEY': self.trade_client.apiKey},
@@ -3476,36 +3383,111 @@ class BinanceSniper:
                     if response.status == 200:
                         return await response.json()
                     else:
-                        logger.error(f"订单执行失败: {response.status}")
+                        self.logger.error(f"订单执行失败: {response.status}")  # 修改这里
                         return None
         except Exception as e:
-            logger.error(f"订单执行异常: {str(e)}")
+            self.logger.error(f"订单执行异常: {str(e)}")  # 修改这里
             return None
 
     async def execute_snipe(self):
         """执行抢购主逻辑"""
-        return await self.order_processor.execute_orders(
-            symbol=self.symbol,
-            amount=self.amount,
-            price=self.max_price_limit,
-            concurrent_orders=3
-        )
-        
-    async def cancel_all_orders(self):
-        """撤销所有订单"""
-        return await self.order_processor.cancel_all_orders(self.symbol)
+        try:
+            return await self.order_processor.execute_orders(
+                symbol=self.symbol,
+                amount=self.amount,
+                price=self.max_price_limit
+            )
+        except Exception as e:
+            self.logger.error(f"抢购执行失败: {str(e)}")
+            return None
+
+    # 添加这个代理方法
+    async def setup_snipe_strategy_async(self):
+        """代理到 OrderProcessor 的策略设置方法"""
+        try:
+            # 确保设置必要的客户端
+            self.order_processor.query_client = self.query_client
+            self.order_processor.trade_client = self.trade_client
+            
+            # 调用 OrderProcessor 的实现
+            return await self.order_processor.setup_snipe_strategy_async()
+            
+        except Exception as e:
+            self.logger.error(f"设置抢购策略失败: {str(e)}")
+            return False
+
+    async def update_market_data(self):
+        """更新市场数据"""
+        try:
+            # 更新价格信息
+            if self.query_client:
+                ticker = await self.query_client.fetch_ticker(self.symbol)
+                self.market_data.update({
+                    'current_price': ticker['last'],
+                    'price_24h_change': ticker['percentage'],
+                    'volume_24h': ticker['quoteVolume'],
+                    'market_status': '正常交易'
+                })
+            
+            # 更新网络和时间信息
+            time_sync_result = await self.time_sync.sync()
+            if time_sync_result:
+                self.market_data.update({
+                    'network_latency': time_sync_result[0],
+                    'time_offset': time_sync_result[1],
+                    'server_time': time_sync_result[2]
+                })
+                
+            return True
+        except Exception as e:
+            self.logger.error(f"更新市场数据失败: {str(e)}")
+            return False
 
 # =============================== 
 # 模块：订单处理
 # ===============================
-
 class OrderProcessor:
     """订单处理核心类"""
     
-    def __init__(self, config: ConfigManager):
+    def __init__(self, config: ConfigManager, data_pool: DataPool, sniper=None):
+        """初始化订单处理器
+        Args:
+            config: 配置管理器实例
+            data_pool: 市场数据池实例
+            sniper: BinanceSniper实例引用
+        """
+        # 基础组件
         self.config = config
+        self.data_pool = data_pool
         self.logger = logging.getLogger(__name__)
         self._executor = ThreadPoolExecutor(max_workers=4)
+        self.sniper = sniper  # 保存 BinanceSniper 引用
+        
+        # 执行配置
+        self.execution_ips = {}
+        self.ip_roles_locked = False
+        self.server_time_offset = 0
+        self.timeout = 5.0
+        self.retry_count = 3
+        self.network_latency = 0
+        
+        # API客户端
+        self.trade_client = None
+        self.query_client = None
+        
+        # 缓存设置
+        self.market_cache = {}
+        self.cache_ttl = 0.5  # 500ms缓存时间
+        
+        # 交易参数
+        self.symbol = None
+        self.amount = 0
+        self.max_price_limit = 0
+        self.advance_time = 0
+        self.concurrent_orders = 0
+        
+        # 添加时区设置
+        self.timezone = pytz.timezone('Asia/Shanghai')  # 添加这一行
 
     def _sign_request(self, params: dict) -> dict:
         """生成请求签名"""
@@ -3535,1028 +3517,47 @@ class OrderProcessor:
             'side': side.upper(),
             'type': order_type.upper(),
             'timeInForce': time_in_force,
-            'quantity': round(amount, 6),  # 符合币安精度要求
-            'price': str(round(price, 4))  # 价格字符串化防止精度问题
+            'quantity': round(amount, 6),
+            'price': str(round(price, 4))
         })
 
-    async def execute_concurrent_orders(self, tasks: list) -> list:
-        """执行并发订单"""
-        try:
-            return await asyncio.gather(*tasks, return_exceptions=True)
-        except asyncio.CancelledError:
-            self.logger.warning("订单任务被取消，正在清理...")
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            raise
-
-    def filter_successful_orders(self, results: list) -> list:
-        """过滤成功订单"""
-        return [
-            order for order in results
-            if isinstance(order, dict) and 
-            order.get('status') in ('FILLED', 'closed')
-        ]
-
-    async def execute_orders(
-        self,
-        symbol: str,
-        amount: float,
-        price: float,
-        concurrent_orders: int = 3
-    ) -> list:
-        """执行批量订单"""
-        base_params = self.build_order_params(
-            symbol=symbol,
-            side='BUY',
-            order_type='LIMIT',
-            amount=amount / concurrent_orders,
-            price=price
-        )
-        
-        tasks = [
-            self._execute_single_order(base_params.copy())
-            for _ in range(concurrent_orders)
-        ]
-        
-        results = await self.execute_concurrent_orders(tasks)
-        return self.filter_successful_orders(results)
-
-    async def _execute_single_order(self, params: dict) -> dict:
-        """执行单个订单"""
-        try:
-            return await asyncio.get_event_loop().run_in_executor(
-                self._executor,
-                self.trade_client.create_order,
-                **params
-            )
-        except Exception as e:
-            self.logger.error(f"订单执行失败: {str(e)}")
-            raise
-
-    async def cancel_all_orders(self, symbol: str) -> int:
-        """撤销所有当前订单"""
-        try:
-            orders = await asyncio.get_event_loop().run_in_executor(
-                self._executor,
-                self.trade_client.fetch_open_orders,
-                symbol
-            )
-            canceled = 0
-            for order in orders:
-                await asyncio.get_event_loop().run_in_executor(
-                    self._executor,
-                    self.trade_client.cancel_order,
-                    order['id'],
-                    symbol
-                )
-                canceled += 1
-            return canceled
-        except Exception as e:
-            self.logger.error(f"撤单失败: {str(e)}")
-            return 0
-
-    async def execute_snipe(self) -> Optional[Dict]:
-        """执行抢购
-        Returns:
-            Optional[Dict]: 成功返回订单信息,失败返回None
-        """
-        try:
-            logger.info("开始执行抢购...")
-            
-            # 1. 检查初始化
-            if not self._is_initialized:
-                logger.error("抢购环境未初始化")
-                return None
-                
-            # 2. 获取市场价格并检查
-            price = await self.get_market_price()
-            if not price:
-                logger.error("无法获取市场价格")
-                return None
-                
-            if price > self.max_price_limit:
-                logger.error(f"价格超出限制: {price} > {self.max_price_limit}")
-                return None
-                
-            # 3. 创建并发订单
-            tasks = []
-            for _ in range(self.concurrent_orders):
-                task = self.create_order(
-                    symbol=self.symbol,
-                    type='LIMIT',
-                    side='BUY',
-                    amount=self.amount/price,
-                    price=price
-                )
-                tasks.append(task)
-                
-            # 4. 执行订单
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # 5. 处理结果
-            for result in results:
-                if isinstance(result, dict) and result.get('status') == 'closed':
-                    logger.info(f"抢购成功: {result}")
-                    return result
-                    
-            return None
-            
-        except Exception as e:
-            logger.error(f"抢购执行失败: {str(e)}")
-            return None
-
-            
-        except Exception as e:
-            logger.error(f"订单执行失败: {str(e)}")
-            return None
-
-    async def _precise_wait(self, target_time: float):
-        """高精度等待
-        Args:
-            target_time: 目标时间戳(毫秒)
-        """
-        while True:
-            current = time.time() * 1000
-            if current >= target_time:
-                break
-                
-            remaining = target_time - current
-            if remaining > 1:
-                await asyncio.sleep(remaining / 2000)  # 转换为秒并减半
-            else:
-                await asyncio.sleep(0)  # 让出CPU时间片
-
-    def show_api_status(self):
-        """显示并测试当前API配置"""
-        print("\n=== 当前API配置状态 ===")
-        
-        # 获取当前配置
-        trade_key, _ = self.config.get_trade_api_keys()
-        query_key, _ = self.config.get_query_api_keys()
-        
-        # 显示配置信息（只显示前6位和后4位，中间用*代替）
-        def mask_key(key: str) -> str:
-            if not key:
-                return "未设置"
-            return f"{key[:6]}{'*' * (len(key)-10)}{key[-4:]}"
-        
-        print(f"""
-交易API Key: {mask_key(trade_key)}
-查询API Key: {mask_key(query_key)}
-""")
-        
-        # 测试API连接
-        print("\n正在测试API连接...")
-        
-        success = True
-        try:
-            # 测试交易API
-            print("\n1. 测试交易API:")
-            balance = self.trade_client.fetch_balance()
-            usdt_balance = balance.get('USDT', {}).get('free', 0)
-            print(f"✅ 连接成功")
-            print(f"   可用USDT余额: {usdt_balance:.2f}")
-            
-            # 测试查询API
-            print("\n2. 测试查询API:")
-            server_time = self.query_client.fetch_time()
-            local_time = int(time.time() * 1000)
-            time_diff = abs(server_time - local_time)
-            print(f"✅ 连接成功")
-            print(f"   服务器时间: {datetime.fromtimestamp(server_time/1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
-            print(f"   时间偏差: {time_diff}ms")
-            
-            # 测试市场数据访问
-            print("\n3. 测试市场数据访问:")
-            btc_ticker = self.query_client.fetch_ticker('BTC/USDT')
-            print(f"✅ 数据访问正常")
-            print(f"   BTC当前价格: {btc_ticker['last']:.2f} USDT")
-            
-            print("\n=== 测试结论 ===")
-            print("API配置状态: 正常 ✨")
-            print(f"建议: 可以开始设置抢购策略")
-            
-        except Exception as e:
-            success = False
-            print(f"\n❌ 测试失败: {str(e)}")
-            print("\n=== 测试结论 ===")
-            print("API配置状态: 异常 ⚠️")
-            print("建议: 请重新设置API密钥")
-        
-        return success
-
-    def setup_api_keys(self):
-        """设置API密钥"""
-        try:
-            print("\n=== API密钥设置 ===")
-            
-            # 检查是否已有API配置
-            has_existing_api = False
-            if self.trade_client and self.query_client:
-                try:
-                    # 测试现有API
-                    print("\n正在测试现有API连接...")
-                    
-                    # 获取交易API信息
-                    trade_balance = self.trade_client.fetch_balance()
-                    trade_key = self.trade_client.apiKey
-                    masked_trade_key = f"{trade_key[:6]}{'*' * (len(trade_key)-10)}{trade_key[-4:]}"
-                    
-                    # 获取查询API信息
-                    query_start = time.time()
-                    server_time = self.query_client.fetch_time()
-                    query_latency = (time.time() - query_start) * 1000
-                    query_key = self.query_client.apiKey
-                    masked_query_key = f"{query_key[:6]}{'*' * (len(query_key)-10)}{query_key[-4:]}"
-                    
-                    # 获取账户权限和余额信息
-                    permissions = trade_balance.get('info', {}).get('permissions', ['unknown'])
-                    usdt_balance = trade_balance.get('USDT', {}).get('free', 0)
-                    total_balance = trade_balance.get('USDT', {}).get('total', 0)
-                    
-                    # 获取账户API状态信息
-                    trade_info = trade_balance.get('info', {})
-                    
-                    # 更准确地检查IP白名单状态
-                    ip_restrict = trade_info.get('ipRestrict', False)
-                    ip_list = trade_info.get('ipList', [])
-                    ip_status = '已配置' if ip_restrict or ip_list else '未配置'
-                    
-                    # 检查2FA状态
-                    enable_withdrawals = trade_info.get('enableWithdraw', False)
-                    enable_internal_transfer = trade_info.get('enableInternalTransfer', False)
-                    enable_futures = trade_info.get('enableFutures', False)
-                    
-                    # 综合判断2FA状态
-                    security_status = '已开启' if (enable_withdrawals or enable_internal_transfer or enable_futures) else '未开启'
-                    
-                    # 计算时间偏移
-                    local_time = int(time.time() * 1000)
-                    time_offset = server_time - local_time
-                    
-                    print(f"""
-====== 当前API状态 ======
-
-交易API信息:
-- API Key: {masked_trade_key}
-- 交易权限: {', '.join(permissions)}
-- USDT余额: {usdt_balance:.2f} (可用)
-- USDT总额: {total_balance:.2f} (总计)
-
-查询API信息:
-- API Key: {masked_query_key}
-- 网络延迟: {query_latency:.2f}ms
-- 时间偏移: {time_offset}ms
-
-系统状态:
-- 服务器时间: {datetime.fromtimestamp(server_time/1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}
-- 本地时间: {datetime.fromtimestamp(local_time/1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}
-- API限额: {self.trade_client.rateLimit}/分钟
-- IP白名单: {ip_status} {f'({len(ip_list)}个IP)' if ip_list else ''}
-- 2FA状态: {security_status}
-- API权限: {'已限制' if ip_restrict else '未限制'}
-
-======================
-""")
-                    
-                    has_existing_api = True
-                    change = input("\n是否要更换API密钥? (y/n): ").strip().lower()
-                    if change != 'y':
-                        print("\nAPI设置未变更")
-                        return True
-                        
-                except Exception as e:
-                    print(f"\n⚠️ 现有API测试失败: {str(e)}")
-                    print("需要重新设置API")
-                    
-            # ... (其他代码保持不变)
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"API设置失败: {str(e)}")
-            print(f"\n❌ API设置失败: {str(e)}")
-            return False
-
-    async def print_strategy_async(self):
-        """异步显示当前策略设置"""
-        try:
-            logger.info("开始打印策略...")
-            
-            # 1. 加载策略文件
-            if not hasattr(self, 'symbol') or not self.symbol:
-                if not await self.load_strategy_async():
-                    print("\n⚠️ 未找到已保存的策略，请先设置策略")
-                    return False
-            
-            # 2. 获取实时市场数据(如果可用)
-            current_price = 0
-            price_24h_change = 0
-            volume_24h = 0
-            
-            # 3. 计算时间相关信息
-            now = datetime.now(self.timezone)
-            time_diff = self.opening_time - now
-            hours_remaining = time_diff.total_seconds() / 3600
-            
-            try:
-                ticker = await asyncio.to_thread(self.query_client.fetch_ticker, self.symbol)
-                current_price = ticker['last']
-                price_24h_change = ticker['percentage']
-                volume_24h = ticker['quoteVolume']
-                market_status = "已上市交易中"
-                
-                print(f"""
-ℹ️ 市场状态
-• 交易对: {self.symbol}
-• 当前价格: {current_price} USDT
-• 24h涨跌: {price_24h_change:.2f}%
-• 24h成交: {volume_24h:.2f} USDT
-• 状态: {market_status}
-• 开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
-• 剩余时间: {int(hours_remaining)}小时{int((hours_remaining % 1) * 60)}分钟
-""")
-
-            except Exception as e:
-                logger.info(f"获取市场数据失败: {str(e)}")
-                print(f"""
-ℹ️ 市场状态
-• 交易对: {self.symbol}
-• 状态: 等待开盘
-• 开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
-• 剩余时间: {int(hours_remaining)}小时{int((hours_remaining % 1) * 60)}分钟
-""")
-
-            # 4. 获取账户余额
-            try:
-                balance = await asyncio.to_thread(self.trade_client.fetch_balance)
-                self.balance = balance.get('USDT', {}).get('free', 0)
-            except Exception as e:
-                logger.error(f"获取余额失败: {str(e)}")
-                self.balance = 0
-
-            # 5. 打印其他策略信息
-            print(f"""
-💰 价格保护
-- 最高限价: {self.max_price_limit} USDT
-- 价格倍数: {self.price_multiplier}倍
-
-⚡ 执行策略
-- 并发订单: {self.concurrent_orders}个
-- 提前时间: {self.advance_time}ms
-
-📈 止盈止损
-- 止损线: -{self.stop_loss*100:.1f}%
-阶梯止盈:""")
-
-            # 打印止盈策略
-            for idx, (profit, amount) in enumerate(self.sell_strategy, 1):
-                print(f"- 第{idx}档: 涨幅{profit*100:.0f}% 卖出{amount*100:.0f}%")
-
-            print(f"""
-💰 账户状态
-- 可用USDT: {self.balance:.2f}
-- 所需USDT: {self.amount:.2f}
-- 状态: {'✅ 余额充足' if self.balance >= self.amount else '❌ 余额不足'}
-
-⚠️ 风险提示
-1. 已启用最高价格保护: {self.max_price_limit} USDT
-2. 已启用价格倍数限制: {self.price_multiplier}倍
-3. 使用IOC限价单模式
-""")
-            
-            logger.info("策略信息打印完成")
-            return True
-            
-        except Exception as e:
-            logger.error(f"打印策略失败: {str(e)}", exc_info=True)
-            print(f"\n⚠️ 打印策略失败: {str(e)}")
-            print("请检查是否已正确设置策略")
-            return False
-
-    def save_strategy(self):
-        """保存当前策略到配置文件"""
-        try:
-            if not hasattr(self, 'opening_time') or not self.opening_time:
-                logger.error("未设置开盘时间")
-                return False
-                
-            if not os.path.exists(self.config.config_dir):
-                os.makedirs(self.config.config_dir)
-                
-            strategy_file = os.path.join(self.config.config_dir, 'strategy.ini')
-            config = configparser.ConfigParser()
-            
-            # 保存基础参数
-            config['Basic'] = {
-                'symbol': self.symbol,
-                'amount': str(self.amount),
-                'opening_time': self.opening_time.strftime('%Y-%m-%d %H:%M:%S')
-            }
-            
-            # 保存价格保护参数
-            config['PriceProtection'] = {
-                'max_price_limit': str(self.max_price_limit),
-                'price_multiplier': str(self.price_multiplier)
-            }
-            
-            # 保存执行参数
-            config['Execution'] = {
-                'concurrent_orders': str(self.concurrent_orders),
-                'advance_time': str(self.advance_time)
-            }
-            
-            # 保存止盈止损策略
-            config['StopStrategy'] = {
-                'stop_loss': str(self.stop_loss),
-                'sell_strategy': json.dumps(self.sell_strategy)  # 将列表转换为JSON字符串
-            }
-            
-            with open(strategy_file, 'w') as f:
-                config.write(f)
-                
-            logger.info("策略已保存到配置文件")
-            return True
-            
-        except Exception as e:
-            logger.error(f"保存策略失败: {str(e)}")
-            return False
-
-    def load_strategy(self) -> bool:
-        """从配置文件加载策略"""
-        try:
-            # 使用正确的配置文件路径
-            strategy_file = '/root/config/strategy.ini'
-            if not os.path.exists(strategy_file):
-                logger.warning(f"未找到策略配置文件: {strategy_file}")
-                return False
-            
-            config = configparser.ConfigParser()
-            config.read(strategy_file)
-            
-            # 加载基础参数
-            self.symbol = config['Basic']['symbol']  # ✅ 确保这里正确赋值
-            self.amount = float(config['Basic']['amount'])
-            
-            # 解析时间并设置时区
-            opening_time_str = config['Basic']['opening_time']
-            self.opening_time = datetime.strptime(
-                opening_time_str,
-                '%Y-%m-%d %H:%M:%S'
-            )
-            # 确保设置东八区时区
-            if self.timezone is None:
-                self.timezone = pytz.timezone('Asia/Shanghai')
-            self.opening_time = self.timezone.localize(self.opening_time)
-            
-            # 加载价格保护参数
-            self.max_price_limit = float(config['PriceProtection']['max_price_limit'])
-            self.price_multiplier = float(config['PriceProtection']['price_multiplier'])
-            
-            # 加载执行参数
-            self.concurrent_orders = int(config['Execution']['concurrent_orders'])
-            self.advance_time = int(config['Execution']['advance_time'])
-            
-            # 加载止盈止损策略
-            self.stop_loss = float(config['StopStrategy']['stop_loss'])
-            self.sell_strategy = json.loads(config['StopStrategy']['sell_strategy'])
-            
-            logger.info(f"""
-[策略加载] 
-✅ 策略配置成功
-• 交易对: {self.symbol}
-• 买入金额: {format_number(self.amount)} USDT
-• 开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S %Z')}
-• 价格保护: 最高 {format_number(self.max_price_limit)} USDT ({self.price_multiplier}倍)
-• 执行参数: {self.concurrent_orders}并发, 提前{self.advance_time}ms
-• 止盈止损: 
-  - 止损: -{self.stop_loss*100:.1f}%
-{chr(10).join([f'  - 止盈{i+1}: +{p*100:.1f}% 卖出{a*100:.1f}%' for i, (p, a) in enumerate(self.sell_strategy)])}
-""")
-            return True
-            
-        except Exception as e:
-            logger.error(f"加载策略失败: {str(e)}")
-            return False
-
-    def update_balance(self):
-        """更新账户余额"""
-        try:
-            balance = self.trade_client.fetch_balance()
-            self.balance = float(balance['USDT']['free'])
-        except Exception as e:
-            logger.error(f"更新余额失败: {str(e)}")
-
-    def _init_clients(self) -> bool:
-        """初始化交易和查询客户端"""
-        try:
-            # 1. 检查API密钥
-            if not self.trade_client or not self.query_client:
-                logger.error("API客户端未初始化，请先设置API密钥")
-                return False
-
-            # 2. 测试交易API连接
-            try:
-                balance = self.trade_client.fetch_balance()
-                self.balance = balance.get('USDT', {}).get('free', 0)
-                permissions = balance.get('info', {}).get('permissions', ['unknown'])
-                
-                logger.info(f"""
-[API测试] 
-✅ 交易API
-• 连接状态: 正常
-• USDT余额: {format_number(self.balance, 6)}
-• API限额: {self.trade_client.rateLimit}次/分钟
-• 账户权限: {', '.join(permissions)}
-""")
-            except Exception as e:
-                logger.error(f"交易API测试失败: {str(e)}")
-                return False
-
-            # 3. 测试查询API连接
-            try:
-                start_time = time.time()
-                server_time = self.query_client.fetch_time()
-                latency = (time.time() - start_time) * 1000
-                time_offset = server_time - int(time.time() * 1000)
-                
-                logger.info(f"""
-✅ 查询API
-• 连接状态: 正常
-• 网络延迟: {format_number(latency, 2)}ms
-• 时间偏移: {format_number(time_offset, 2)}ms
-""")
-            except Exception as e:
-                logger.error(f"查询API测试失败: {str(e)}")
-                return False
-
-            # 4. 检查市场状态
-            try:
-                logger.info(f"""
-ℹ️ 市场状态
-• 交易对: {self.symbol} (未上线)
-• 状态: 等待开盘
-• 备注: 新币抢购模式
-""")
-            except Exception as e:
-                logger.warning(f"市场状态检查失败: {str(e)}")
-
-            return True
-        
-        except Exception as e:
-            logger.error(f"初始化客户端失败: {str(e)}")
-            return False
-
-    async def _measure_network_stats_async(self, samples: int = 5) -> Optional[Dict[str, float]]:
-        """异步测量网络状态"""
-        try:
-            latencies = []
-            offsets = []
-            
-            for _ in range(samples):
-                start_time = time.time() * 1000
-                # 使用 asyncio.to_thread 包装同步调用
-                server_time = await asyncio.to_thread(self.query_client.fetch_time)
-                end_time = time.time() * 1000
-                
-                latency = end_time - start_time
-                offset = server_time - start_time
-                
-                latencies.append(latency)
-                offsets.append(offset)
-                
-                await asyncio.sleep(0.1)
-                
-            avg_latency = statistics.mean(latencies)
-            jitter = statistics.stdev(latencies) if len(latencies) > 1 else 0
-            avg_offset = statistics.mean(offsets)
-            
-            return {
-                'latency': avg_latency,
-                'jitter': jitter,
-                'offset': avg_offset
-            }
-            
-        except Exception as e:
-            logger.error(f"网络状态测量失败: {str(e)}")
-            return None
-
-    def _filter_outliers(self, data: List[float]) -> List[float]:
-        """过滤异常值"""
-        if len(data) < 4:
-            return data
-            
-        # 计算四分位数
-        sorted_data = sorted(data)
-        q1 = sorted_data[len(sorted_data)//4]
-        q3 = sorted_data[3*len(sorted_data)//4]
-        iqr = q3 - q1
-        
-        # 过滤异常值
-        return [x for x in data if q1 - 1.5*iqr <= x <= q3 + 1.5*iqr]
-
-    async def _make_request(self, url: str, method: str = "GET", **kwargs):
-        """优化的API请求方法"""
-        cache_key = f"{url}_{kwargs.get('params', '')}"
-        current_time = time.time()
-        
-        # 检查缓存
-        if cache_key in self.market_data_cache:
-            cache_data = self.market_data_cache[cache_key]
-            if current_time - cache_data['timestamp'] < self.cache_ttl:
-                return cache_data['data']
-
-        # 获取最佳IP并检查请求限制
-        ip = await self.ip_manager.get_best_ip()
-        if ip not in self.last_rest_request:
-            self.last_rest_request[ip] = []
-            
-        # 清理旧的请求记录
-        self.last_rest_request[ip] = [t for t in self.last_rest_request[ip] 
-                                    if current_time - t < 60]
-                                    
-        # 检查是否超过限制
-        if len(self.last_rest_request[ip]) >= 1100:
-            self.logger.warning(f"IP {ip} 接近请求限制，等待重置")
-            await asyncio.sleep(0.1)
-            
-        try:
-            kwargs['source_address'] = (ip, 0)
-            async with aiohttp.ClientSession() as session:
-                async with getattr(session, method.lower())(url, **kwargs) as response:
-                    data = await response.json()
-                    
-                    # 更新缓存和请求计数
-                    self.market_data_cache[cache_key] = {
-                        'data': data,
-                        'timestamp': current_time
-                    }
-                    self.last_rest_request[ip].append(current_time)
-                    return data
-                    
-        except Exception as e:
-            await self.ip_manager.report_error(ip)
-            self.logger.error(f"请求失败 (IP: {ip}): {e}")
-            raise
-
-    async def get_market_data(self, symbol: str) -> Dict:
-        """优化的市场数据获取"""
-        try:
-            # 1. 先检查缓存
-            cache_key = f"{symbol}_market_data"
-            current_time = time.time()
-            
-            if (cache_key in self.market_data_cache and 
-                current_time - self.market_data_cache[cache_key]['timestamp'] < self.cache_ttl):
-                return self.market_data_cache[cache_key]
-
-            # 2. 使用已分配的IP获取数据
-            if hasattr(self, 'execution_ips'):
-                ip = self.execution_ips['primary']  # 使用主IP
-            else:
-                ip = await self.ip_manager.get_best_ip()
-
-            # 3. 获取数据
-            params = {'symbol': symbol}
-            ticker = await self.query_client.fetch_ticker(symbol)
-            orderbook = await self.query_client.fetch_order_book(symbol)
-            
-            # 4. 整合数据
-            market_data = {
-                'ticker': ticker,
-                'orderbook': orderbook,
-                'timestamp': current_time,
-                'price': float(ticker['last']),
-                'bid': float(ticker['bid']),
-                'ask': float(ticker['ask']),
-                'volume': float(ticker['baseVolume'])
-            }
-            
-            # 5. 更新缓存和状态
-            self.market_data_cache[cache_key] = market_data
-            self._update_market_status(market_data)
-            
-            return market_data
-
-        except Exception as e:
-            self.logger.error(f"获取市场数据失败: {e}")
-            raise
-
-    def _update_market_status(self, market_data: Dict):
-        """更新市场状态"""
-        self.market_status = {
-            'symbol_active': True,
-            'has_orderbook': bool(market_data['orderbook']['bids'] or market_data['orderbook']['asks']),
-            'has_trades': market_data['volume'] > 0,
-            'last_update': time.time()
-        }
-
-    async def monitor_market_status(self):
-        """持续监控市场状态"""
-        while True:
-            try:
-                # 使用已分配的IP
-                if hasattr(self, 'execution_ips'):
-                    ip = self.execution_ips['primary']
-                else:
-                    ip = await self.ip_manager.get_best_ip()
-
-                # 获取最新市场数据
-                market_data = await self.get_market_data(self.symbol)
-                
-                # 分析价格变动
-                if 'last_price' in self.market_status:
-                    price_change = abs(market_data['price'] - self.market_status['last_price'])
-                    if price_change > self.price_change_threshold:
-                        self.logger.warning(f"价格剧烈波动: {price_change}")
-
-                # 分析深度变化
-                if market_data['orderbook']['bids'] and market_data['orderbook']['asks']:
-                    spread = float(market_data['orderbook']['asks'][0][0]) - float(market_data['orderbook']['bids'][0][0])
-                    if spread > self.spread_threshold:
-                        self.logger.warning(f"买卖价差过大: {spread}")
-
-                # 更新状态
-                self.market_status['last_price'] = market_data['price']
-                
-                await asyncio.sleep(0.1)  # 100ms检查间隔
-                
-            except Exception as e:
-                self.logger.error(f"市场状态监控失败: {str(e)}")
-                await asyncio.sleep(1)  # 出错后等待1秒
-
-    async def batch_market_data(self, symbols: List[str]) -> Dict:
-        """批量获取多个交易对的市场数据"""
-        try:
-            # 使用已分配的IP
-            if hasattr(self, 'execution_ips'):
-                tasks = [
-                    self.get_market_data(symbol) 
-                    for symbol in symbols
-                ]
-            else:
-                # 如果IP未分配，使用多IP并发
-                tasks = []
-                for i, symbol in enumerate(symbols):
-                    ip_index = i % len(self.ip_manager.ips)
-                    tasks.append(
-                        self.get_market_data(
-                            symbol, 
-                            ip=self.ip_manager.ips[ip_index]
-                        )
-                    )
-            
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            market_data = {}
-            for symbol, result in zip(symbols, results):
-                if isinstance(result, Exception):
-                    self.logger.warning(f"{symbol} 数据获取失败: {result}")
-                    continue
-                market_data[symbol] = result
-                
-            return market_data
-            
-        except Exception as e:
-            self.logger.error(f"批量获取市场数据失败: {e}")
-            raise
-
-    async def sync_server_time(self) -> float:
-        """同步币安服务器时间"""
-        try:
-            local_send_time = time.time() * 1000
-            server_time = await self.query_client.fetch_time()
-            local_recv_time = time.time() * 1000
-            
-            # 计算网络延迟
-            network_latency = (local_recv_time - local_send_time) / 2
-            
-            # 计算时间偏差
-            server_time_ms = server_time['serverTime']
-            time_offset = server_time_ms - (local_send_time + network_latency)
-            
-            # 保存样本
-            self.time_samples.append({
-                'offset': time_offset,
-                'latency': network_latency,
-                'timestamp': local_send_time
-            })
-            
-            # 计算稳定的时间偏差(使用中位数)
-            recent_offsets = [sample['offset'] for sample in self.time_samples]
-            self.server_time_offset = statistics.median(recent_offsets)
-            
-            self.last_time_sync = local_send_time
-            self.logger.debug(f"时间同步完成: 偏差 {self.server_time_offset}ms, 延迟 {network_latency}ms")
-            
-            return network_latency
-            
-        except Exception as e:
-            self.logger.error(f"同步服务器时间失败: {str(e)}")
-            raise TimeError("无法同步服务器时间")
-
-    def get_server_time(self) -> float:
-        """获取当前币安服务器时间(毫秒)"""
-        return time.time() * 1000 + self.server_time_offset
-
-    async def maintain_time_sync(self):
-        """维护时间同步"""
-        while True:
-            try:
-                current_time = time.time() * 1000
-                if current_time - self.last_time_sync >= self.time_sync_interval * 1000:
-                    await self.sync_server_time()
-                await asyncio.sleep(0.1)  # 100ms检查一次
-            except Exception as e:
-                self.logger.error(f"时间同步维护失败: {str(e)}")
-                await asyncio.sleep(1)  # 出错后等待1秒再试
-
-    async def calculate_execution_time(self, target_time: float) -> float:
-        """计算实际执行时间
-        Args:
-            target_time: 目标执行时间(毫秒)
-        Returns:
-            实际应该执行的时间(毫秒)
-        """
-        # 确保时间同步是最新的
-        if time.time() * 1000 - self.last_time_sync >= self.time_sync_interval * 1000:
-            await self.sync_server_time()
-        
-        # 获取最近的网络延迟样本
-        recent_latencies = [sample['latency'] for sample in self.time_samples]
-        if not recent_latencies:
-            raise TimeError("没有足够的网络延迟样本")
-        
-        # 使用95分位数作为网络延迟估计
-        network_latency = statistics.quantiles(recent_latencies, n=20)[-1]
-        
-        # 计算完整提前量
-        advance_time = network_latency + 50  # 网络延迟 + 50ms安全边际
-        
-        # 返回实际执行时间(考虑服务器时间偏差)
-        return target_time - advance_time
-
-    async def check_symbol_status(self) -> dict:
-        """检查交易对状态
-        Returns:
-            dict: {
-                'active': bool,  # 交易对是否可用
-                'status': str,   # 交易对状态
-                'msg': str       # 详细信息
-            }
-        """
-        try:
-            # 使用3个IP并发检查
-            tasks = []
-            for ip in list(self.ip_manager.ips)[:3]:
-                    tasks.append(self._check_symbol_with_ip(ip))
-            
-            if not tasks:
-                return {
-                    'active': False,
-                    'status': 'error',
-                    'msg': '没有可用的IP进行检查'
-                }
-            
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            valid_results = [r for r in results if isinstance(r, dict) and not isinstance(r, Exception)]
-            
-            if not valid_results:
-                return {
-                    'active': False,
-                    'status': 'error',
-                    'msg': '所有IP检查失败'
-                }
-            
-            # 任一IP检查成功即可
-            for result in valid_results:
-                if result.get('active'):
-                    return result
-            
-            # 如果都没成功，返回第一个结果
-            return valid_results[0]
-            
-        except Exception as e:
-            logger.error(f"检查交易对状态失败: {str(e)}")
-            return {
-                'active': False,
-                'status': 'error',
-                'msg': f'检查失败: {str(e)}'
-            }
-
-    async def _check_symbol_with_ip(self, ip: str) -> dict:
-        """使用指定IP检查交易对状态"""
-        try:
-            # 1. 检查交易对信息
-            exchange_info = await asyncio.to_thread(
-                self.query_client.fetch_markets
-            )
-            symbol_info = None
-            
-            for market in exchange_info:
-                if market['symbol'] == self.symbol:
-                    symbol_info = market
-                    break
-            
-            if not symbol_info:
-                return {
-                    'active': False,
-                    'status': 'not_found',
-                    'msg': f'交易对 {self.symbol} 不存在'
-                }
-            
-            # 2. 检查订单簿
-            try:
-                orderbook = await asyncio.to_thread(
-                    self.query_client.fetch_order_book,
-                    self.symbol
-                )
-                has_orderbook = bool(orderbook['bids'] or orderbook['asks'])
-            except Exception as e:
-                logger.error(f"获取订单簿失败: {str(e)}")
-                has_orderbook = False         
-                        
-            # 3. 检查24小时统计
-            try:
-                ticker = await asyncio.to_thread(
-                    self.query_client.fetch_ticker,
-                    self.symbol
-                )
-                has_trades = ticker.get('baseVolume', 0) > 0
-            except:
-                has_trades = False
-            
-            # 4. 综合判断
-            is_active = (
-                symbol_info.get('active', False) or  # 允许未上线的新币
-                has_orderbook or
-                has_trades
-            )
-            
-            status_msg = '交易对未上线' if not is_active else '交易对已上线'
-            
-            return {
-                'active': True,  # 对于新币，即使未上线也返回 True
-                'status': 'pending' if not is_active else 'active',
-                'msg': status_msg,
-                'orderbook': has_orderbook,
-                'trades': has_trades,
-                'info': symbol_info
-            }
-            
-        except Exception as e:
-            logger.error(f"使用IP {ip} 检查失败: {str(e)}")
-            return {
-                'active': False,
-                'status': 'error',
-                'msg': f'检查失败: {str(e)}'
-            }
-
     async def execute_orders_with_strategy(self) -> List[dict]:
-        """使用分批策略执行订单
-        Returns:
-            List[dict]: 成功执行的订单列表
-        """
+        """使用分批策略执行订单"""
         orders = []
         execution_start = self.get_server_time()
         
         try:
-            # 1. 交易对状态检查
-            status = await self.check_symbol_status()
-            if not status['active']:
-                raise MarketError(f"交易对不可用: {status['msg']}")
+            # 1. 获取最新市场数据
+            market_data = await self.data_pool.get_latest_data()
+            if not market_data:
+                raise MarketError("无法获取市场数据")
 
-            # 2. 三批次执行策略
-            # 第1批: T+0ms (2个订单)
-            self.logger.info("执行第1批订单...")
-            first_batch = await self._execute_batch(
-                batch_size=2,
-                time_offset=0,
-                ip=self.execution_ips['primary']
-            )
-            if first_batch:
-                return first_batch
+            # 2. 检查价格
+            current_price = market_data['price']
+            if current_price > self.max_price_limit:
+                raise MarketError(f"当前价格 {current_price} 超过限制 {self.max_price_limit}")
 
-            # 第2批: T+5ms (2个订单)
-            self.logger.info("执行第2批订单...")
-            second_batch = await self._execute_batch(
-                batch_size=2,
-                time_offset=5,
-                ip=self.execution_ips['secondary']
-            )
-            if second_batch:
-                return second_batch
-
-            # 第3批: T+10ms (1个订单)
-            self.logger.info("执行第3批订单...")
-            final_batch = await self._execute_batch(
-                batch_size=1,
-                time_offset=10,
-                ip=self.execution_ips['fallback']
-            )
-            if final_batch:
-                return final_batch
+            # 3. 三批次执行策略
+            batches = [
+                (2, 0, 'primary'),   # 第1批: 2个订单, 0ms延迟
+                (2, 5, 'secondary'), # 第2批: 2个订单, 5ms延迟
+                (1, 10, 'fallback')  # 第3批: 1个订单, 10ms延迟
+            ]
+            
+            for batch_num, (size, offset, ip_role) in enumerate(batches, 1):
+                self.logger.info(f"执行第{batch_num}批订单...")
+                current_price = await self.data_pool.get_latest_price()
+                
+                batch_result = await self._execute_batch(
+                    batch_size=size,
+                    time_offset=offset,
+                    ip=self.execution_ips[ip_role],
+                    price=current_price
+                )
+                
+                if batch_result:
+                    await self.print_batch_result(batch_num, batch_result)
+                    return batch_result
 
             total_time = self.get_server_time() - execution_start
             self.logger.warning(f"所有批次执行完成，总耗时: {total_time}ms，无成功订单")
@@ -4566,33 +3567,24 @@ class OrderProcessor:
             self.logger.error(f"订单执行策略失败: {str(e)}")
             return orders
 
-    async def _execute_batch(self, batch_size: int, time_offset: int, ip: str) -> List[dict]:
-        """执行一批订单
-        Args:
-            batch_size: 订单数量
-            time_offset: 相对于基准时间的偏移(ms)
-            ip: 使用的IP地址
-        Returns:
-            List[dict]: 成功的订单列表
-        """
+    async def _execute_batch(self, batch_size: int, time_offset: int, ip: str, price: float) -> List[dict]:
+        """执行一批订单"""
         orders = []
         try:
-            # 计算执行时间
             base_time = self.get_server_time()
             execution_time = base_time + time_offset
 
-            # 创建订单任务
-            tasks = []
-            for _ in range(batch_size):
-                tasks.append(self._place_single_order(
+            tasks = [
+                self._place_single_order(
                     ip=ip,
-                    execution_time=execution_time
-                ))
+                    execution_time=execution_time,
+                    price=price
+                )
+                for _ in range(batch_size)
+            ]
 
-            # 并发执行订单
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            # 处理结果
             for result in results:
                 if isinstance(result, Exception):
                     self.logger.error(f"订单执行失败: {str(result)}")
@@ -4606,39 +3598,29 @@ class OrderProcessor:
             self.logger.error(f"批次执行失败: {str(e)}")
             return orders
 
-    async def _place_single_order(self, ip: str, execution_time: float) -> Optional[dict]:
-        """执行单个订单
-        Args:
-            ip: 使用的IP
-            execution_time: 目标执行时间(ms)
-        Returns:
-            Optional[dict]: 订单结果
-        """
+    async def _place_single_order(self, ip: str, execution_time: float, price: float) -> Optional[dict]:
+        """执行单个订单"""
         try:
-            # 等待直到执行时间
             current_time = self.get_server_time()
             if current_time < execution_time:
                 wait_time = (execution_time - current_time) / 1000
                 if wait_time > 0:
                     await asyncio.sleep(wait_time)
 
-            # 准备订单参数
-            order_params = {
-                'symbol': self.symbol,
-                'type': 'LIMIT',
-                'side': 'BUY',
-                'price': self.price,
-                'amount': self.amount,
-                'timeInForce': 'GTC',
-                'timestamp': int(execution_time)
-            }
+            order_params = self.build_order_params(
+                symbol=self.symbol,
+                side='BUY',
+                order_type='LIMIT',
+                amount=self.amount,
+                price=price,
+                time_in_force='GTC'
+            )
+            order_params['timestamp'] = int(execution_time)
 
-            # 执行订单
             start_time = self.get_server_time()
             order = await self.trade_client.create_order(**order_params)
             execution_latency = self.get_server_time() - start_time
 
-            # 记录执行延迟
             self.logger.info(f"订单执行完成 - IP: {ip}, 延迟: {execution_latency}ms")
             
             return order
@@ -4647,220 +3629,279 @@ class OrderProcessor:
             await self.ip_manager.report_error(ip)
             raise ExecutionError(f"订单执行失败: {str(e)}")
 
-    async def test_performance(self, duration=120):
-        """测试当前配置的性能"""
-        await self._test_performance_async(duration)  # 直接调用异步方法
+    def get_server_time(self) -> float:
+        """获取当前币安服务器时间(毫秒)"""
+        return time.time() * 1000 + (self.server_time_offset or 0)
 
-    async def _test_performance_async(self, duration):
-        # 保持现有新实现逻辑不变
-        print("\n=== 开始性能测试 ===")
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+    # ... (其他方法保持不变,包括之前的打印方法)
+    async def print_order_status(self, order: dict):
+        """打印订单状态信息"""
         try:
-            # 旧的事件循环调用
-            loop.run_until_complete(self._test_performance_async(duration))
+            print(f"""
+====== 订单状态 ======
+订单ID: {order['id']}
+状态: {order['status']}
+价格: {order['price']} USDT
+数量: {order['amount']}
+成交量: {order['filled']}
+剩余量: {order['remaining']}
+成交金额: {order['cost']} USDT
+时间: {datetime.fromtimestamp(order['timestamp']/1000).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}
+==================
+""")
         except Exception as e:
-            print(f"性能测试失败: {str(e)}")
-        finally:
-            loop.close()
-            print("测试结束")
+            self.logger.error(f"打印订单状态失败: {str(e)}")
 
-    async def test_network(self):  # 保留新实现
-        """整合后的网络测试"""
+    async def print_execution_summary(self, results: List[dict]):
+        """打印执行汇总信息"""
         try:
-            print("\n=== 开始测试网络模拟运行 ===")
-            
-            # 1. 切换到测试网络
-            self.trade_client.set_sandbox_mode(True)
-            self.query_client.set_sandbox_mode(True)
-            
-            # 2. 设置更短的测试时间（5分钟后开盘）
-            original_opening_time = self.opening_time
-            self.opening_time = datetime.now(self.timezone) + timedelta(minutes=5)
+            successful = [r for r in results if r.get('status') == 'filled']
+            total_filled = sum(order['filled'] for order in successful)
+            total_cost = sum(order['cost'] for order in successful)
             
             print(f"""
-测试模式配置:
-• 环境: 测试网络
-• 模拟开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')}
-• 交易对: {self.symbol}
-• 买入金额: {format_number(self.amount)} USDT
-• 并发订单数: {self.concurrent_orders}
+====== 执行汇总 ======
+成功订单: {len(successful)}/{len(results)}
+成交数量: {total_filled}
+成交金额: {total_cost} USDT
+平均价格: {total_cost/total_filled if total_filled else 0} USDT
+==================
+""")
+        except Exception as e:
+            self.logger.error(f"打印执行汇总失败: {str(e)}")
+
+    async def print_batch_result(self, batch_num: int, results: List[dict]):
+        """打印批次执行结果"""
+        try:
+            successful = [r for r in results if r.get('status') == 'filled']
+            print(f"""
+====== 第{batch_num}批执行结果 ======
+订单数量: {len(results)}
+成功数量: {len(successful)}
+成交详情:""")
+            
+            for order in successful:
+                print(f"""
+• 订单ID: {order['id']}
+  价格: {order['price']} USDT
+  数量: {order['filled']}
+  金额: {order['cost']} USDT
+  延迟: {order.get('execution_latency', 0):.2f}ms""")
+            
+            print("==================")
+            
+        except Exception as e:
+            self.logger.error(f"打印批次结果失败: {str(e)}")
+
+    def show_execution_stats(self):
+        """显示执行统计信息"""
+        print(f"""
+====== 执行统计 ======
+IP分配:
+• 主要IP: {self.execution_ips.get('primary', 'N/A')}
+• 备用IP: {self.execution_ips.get('secondary', 'N/A')}
+• 故障转移IP: {self.execution_ips.get('fallback', 'N/A')}
+
+执行配置:
+• 批次数量: 3
+• 总订单数: 5
+• 时间间隔: 5ms
+• 超时设置: {self._executor._max_workers}线程/{self.timeout}秒
+
+网络状态:
+• 服务器延迟: {self.network_latency:.2f}ms
+• 时间偏差: {self.server_time_offset:.2f}ms
+==================
 """)
 
-            # 3. 执行完整流程
-            result = await self.prepare_and_snipe_async()
-            
-            # 4. 如果下单成功，测试止盈止损
-            if result and result.get('filled', 0) > 0:
-                entry_price = result['average']
-                filled_amount = result['filled']
-                
-                print("\n=== 开始测试止盈止损 ===")
-                
-                # 设置止损单
-                stop_loss_price = entry_price * (1 - self.stop_loss)
-                try:
-                    stop_loss_order = await asyncio.to_thread(
-                        self.trade_client.create_order,
-                        symbol=self.symbol,
-                        type='STOP_LOSS_LIMIT',
-                        side='SELL',
-                        amount=filled_amount,
-                        price=stop_loss_price,
-                        params={'stopPrice': stop_loss_price}
-                    )
-                    print(f"• 止损单已设置: 价格 {format_number(stop_loss_price)} USDT")
-                except Exception as e:
-                    print(f"• 止损单设置失败: {str(e)}")
-                
-                # 设置止盈单
-                for i, (price_level, amount_ratio) in enumerate(self.sell_strategy):
-                    target_price = entry_price * (1 + price_level)
-                    sell_amount = filled_amount * amount_ratio
-                    try:
-                        take_profit_order = await asyncio.to_thread(
-                            self.trade_client.create_order,
-                            symbol=self.symbol,
-                            type='LIMIT',
-                            side='SELL',
-                            amount=sell_amount,
-                            price=target_price
-                        )
-                        print(f"• 止盈单{i+1}已设置: 价格 {format_number(target_price)} USDT, 数量 {format_number(sell_amount)}")
-                    except Exception as e:
-                        print(f"• 止盈单{i+1}设置失败: {str(e)}")
-                
-                # 查询当前订单状态
-                try:
-                    open_orders = await asyncio.to_thread(
-                        self.trade_client.fetch_open_orders,
-                        symbol=self.symbol
-                    )
-                    print(f"\n当前挂单数量: {len(open_orders)}")
-                    for order in open_orders:
-                        print(f"• 订单ID: {order['id']}, 类型: {order['type']}, 价格: {order['price']}, 数量: {order['amount']}")
-                except Exception as e:
-                    print(f"查询订单失败: {str(e)}")
-                
-            print("\n=== 测试运行完成 ===")
-            
-            # 恢复原始设置
-            self.opening_time = original_opening_time
-            self.trade_client.set_sandbox_mode(False)
-            self.query_client.set_sandbox_mode(False)
-            
-        except Exception as e:
-            logger.error(f"测试运行失败: {str(e)}")
-            print(f"测试运行失败: {str(e)}")
-        finally:
-            # 确保清理所有测试订单
-            try:
-                await asyncio.to_thread(
-                    self.trade_client.cancel_all_orders,
-                    symbol=self.symbol
-                )
-            except Exception as e:
-                logger.error(f"清理测试订单失败: {str(e)}")
-
-    async def monitor_symbol_status(self):
-        """持续监控交易对状态"""
-        while True:
-            try:
-                status = await self.check_symbol_status()
-                if status['active']:
-                    self.logger.info(f"交易对 {self.symbol} 状态: {status['msg']}")
-                    return True
-                else:
-                    self.logger.debug(f"交易对 {self.symbol} 状态: {status['msg']}")
-                await asyncio.sleep(0.1)  # 100ms检查一次
-            except Exception as e:
-                self.logger.error(f"监控交易对状态失败: {str(e)}")
-                await asyncio.sleep(1)  # 出错后等待1秒
-
-    async def prepare_ips(self):
-        """IP准备和角色分配"""
+    async def print_market_status(self):
+        """打印市场状态"""
         try:
-            available_ips = list(self.ip_manager.ips)
-            if len(available_ips) < 3:
-                raise RuntimeError(f"可用IP不足，当前只有 {len(available_ips)} 个IP")
+            market_data = await self.data_pool.get_latest_data()
+            if not market_data:
+                print("\n⚠️ 无法获取市场数据")
+                return
 
-            # 简单分配IP角色
-            self.execution_ips = {
-                'primary': available_ips[0],    # 第一个IP作为主要IP
-                'secondary': available_ips[1],   # 第二个IP作为次要IP
-                'fallback': available_ips[2]     # 第三个IP作为备用IP
-            }
+            print(f"""
+====== 市场状态 ======
+交易对: {self.symbol}
+当前价格: {market_data['price']} USDT
+买一价: {market_data['bid']} USDT
+卖一价: {market_data['ask']} USDT
+24h成交量: {market_data['volume']} 
+深度更新: {datetime.fromtimestamp(market_data['timestamp']/1000).strftime('%H:%M:%S.%f')[:-3]}
+==================
+""")
+        except Exception as e:
+            self.logger.error(f"打印市场状态失败: {str(e)}")
 
-            self.logger.info(f"IP角色分配完成: {self.execution_ips}")
-            self.ip_roles_locked = True
-            return True
+    async def print_order_book(self, depth: int = 5):
+        """打印订单簿"""
+        try:
+            order_book = await self.data_pool.get_order_book()
+            
+            print(f"\n====== {self.symbol} 订单簿 ======")
+            print("\n卖单:")
+            for price, amount in reversed(order_book['asks'][:depth]):
+                print(f"  {price:10.8f} | {amount:10.8f}")
+                
+            print("\n买单:")
+            for price, amount in order_book['bids'][:depth]:
+                print(f"  {price:10.8f} | {amount:10.8f}")
+                
+            print("\n==================")
 
         except Exception as e:
-            self.logger.error(f"IP准备失败: {str(e)}")
-            return False
+            self.logger.error(f"打印订单簿失败: {str(e)}")
 
-    async def validate_ips(self):
-        """验证所有IP可用性"""
+    async def print_strategy_status(self):
+        """打印策略状态"""
         try:
-            for role, ip in self.execution_ips.items():
-                # 使用 fetch_time 替代 ping 来测试连接
-                try:
-                    # 使用 asyncio.to_thread 包装同步调用
-                    await asyncio.to_thread(
-                        self.query_client.fetch_time
-                    )
-                    logger.info(f"IP {ip} ({role}) 验证通过")
-                except Exception as e:
-                    logger.error(f"IP {ip} ({role}) 验证失败: {str(e)}")
-                    return False
-            
-            logger.info("所有IP验证通过")
-            return True
+            market_data = await self.data_pool.get_latest_data()
+            balance = await self.trade_client.fetch_balance()
+            usdt_balance = balance.get('USDT', {}).get('free', 0)
 
+            print(f"""
+====== 策略状态 ======
+基本信息:
+• 交易对: {self.symbol}
+• 当前价格: {market_data['price']} USDT
+• 可用USDT: {usdt_balance:.2f}
+
+执行设置:
+• 最大价格: {self.max_price_limit} USDT
+• 买入金额: {self.amount} USDT
+• 分批执行: {self.concurrent_orders}个订单
+• 时间提前: {self.advance_time}ms
+
+风险控制:
+• 价格保护: 最高{self.max_price_limit} USDT
+• 订单超时: {self.timeout}秒
+• 重试次数: {self.retry_count}次
+
+网络状态:
+• 主IP延迟: {self.network_latency:.2f}ms
+• 备用IP数: {len(self.execution_ips)-1}个
+• 时间偏差: {self.server_time_offset:.2f}ms
+==================
+""")
         except Exception as e:
-            self.logger.error(f"IP验证失败: {str(e)}")
-            return False
+            self.logger.error(f"打印策略状态失败: {str(e)}")
 
-    async def create_ws_connection(self, ip):
-        """创建WebSocket连接"""
+    async def print_execution_progress(self, current: int, total: int, status: str):
+        """打印执行进度"""
         try:
-            # 使用IP绑定的WebSocket连接
-            ws_url = f"wss://stream.binance.com:9443/ws"
-            ws = await websockets.connect(
-                ws_url,
-                extra_headers={
-                    'Host': 'stream.binance.com',
-                    'User-Agent': f'BinanceSniper/1.0 IP/{ip}'
-                },
-                ssl=True,
-                timeout=5
-            )
+            progress = current / total * 100
+            print(f"""
+执行进度: [{current}/{total}] {progress:.1f}%
+状态: {status}
+时间: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}
+""")
+        except Exception as e:
+            self.logger.error(f"打印进度失败: {str(e)}")
+
+    async def monitor_order_execution(self, order_id: str) -> dict:
+        """监控订单执行状态"""
+        try:
+            while True:
+                order = await self.trade_client.fetch_order(order_id, self.symbol)
+                if order['status'] in ['filled', 'canceled', 'rejected']:
+                    await self.print_order_status(order)
+                    return order
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            self.logger.error(f"监控订单状态失败: {str(e)}")
+            raise
+
+    async def print_strategy_async(self):
+        """打印当前策略配置"""
+        try:
+            # 确保市场数据是最新的
+            await self.sniper.update_market_data()
+            market_data = self.sniper.market_data
             
-            # 订阅行情
-            await ws.send(json.dumps({
-                "method": "SUBSCRIBE",
-                "params": [
-                    "btcusdt@ticker"
-                ],
-                "id": int(time.time() * 1000)
-            }))
-            
-            # 等待订阅确认
-            response = await ws.recv()
-            if json.loads(response).get('result') is None:
-                return ws
+            # 获取当前时间和剩余时间
+            now = datetime.now(self.timezone)
+            if hasattr(self, 'opening_time'):
+                time_diff = self.opening_time - now
+                hours_remaining = time_diff.total_seconds() / 3600
             else:
-                await ws.close()
-                return None
-                
-        except Exception as e:
-            logger.error(f"WebSocket连接失败 (IP: {ip}): {str(e)}")
-            return None
+                hours_remaining = 0
+            
+            # 计算实际的提前时间
+            advance_time = (
+                market_data['network_latency'] +  # 网络延迟
+                abs(market_data['time_offset']) +  # 时间偏移
+                5  # 安全冗余
+            )
 
+            print(f"""
+====== 当前抢购策略详情 ======
+
+📌 基础参数
+- 交易对: {self.symbol or '未设置'}
+- 买入金额: {self.amount or 0:,.2f} USDT
+- 买入数量: {"待定" if market_data['current_price'] == 0 else f"{self.amount/market_data['current_price']:.8f} {self.symbol.split('/')[0] if self.symbol else ''}"}
+
+📊 市场信息
+- 币种状态: {market_data['market_status']}
+- 当前价格: {"未上市" if market_data['current_price'] == 0 else f"{market_data['current_price']:,.2f} USDT"}
+- 24h涨跌: {"未上市" if market_data['current_price'] == 0 else f"{market_data['price_24h_change']:.2f}%"}
+- 24h成交: {"未上市" if market_data['current_price'] == 0 else f"{market_data['volume_24h']:,.2f} USDT"}
+
+⏰ 时间信息
+- 开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S') if hasattr(self, 'opening_time') else '未设置'}
+- 当前时间: {now.strftime('%Y-%m-%d %H:%M:%S')}
+- 剩余时间: {int(hours_remaining)}小时{int((hours_remaining % 1) * 60)}分钟
+
+💰 价格保护
+- 最高限价: {self.max_price_limit or 0:,.2f} USDT
+- 价格倍数: {self.price_multiplier or 0}倍
+
+⚡ 执行策略
+- 并发订单: {self.concurrent_orders or 0}个
+- 提前时间: {advance_time:.2f}ms
+- 网络延迟: {market_data['network_latency']:.2f}ms
+- 时间偏移: {market_data['time_offset']:.2f}ms
+- 安全冗余: 5ms
+
+📈 止盈止损
+- 止损线: -{self.stop_loss*100:.1f}%
+阶梯止盈:""")
+
+            # 打印止盈策略
+            if hasattr(self, 'sell_strategy'):
+                for idx, (profit, amount) in enumerate(self.sell_strategy, 1):
+                    print(f"- 第{idx}档: 涨幅{profit*100:.0f}% 卖出{amount*100:.0f}%")
+
+            # 尝试获取账户余额
+            try:
+                balance = await self.trade_client.fetch_balance() if self.trade_client else None
+                usdt_balance = balance['USDT']['free'] if balance and 'USDT' in balance else 0
+            except:
+                usdt_balance = 0
+
+            print(f"""
+💰 账户状态
+- 可用USDT: {usdt_balance:,.2f}
+- 所需USDT: {self.amount or 0:,.2f}
+- 状态: {'✅ 余额充足' if usdt_balance >= (self.amount or 0) else '❌ 余额不足'}
+
+⚠️ 风险提示
+1. 已启用最高价格保护: {self.max_price_limit or 0:,.2f} USDT
+2. 已启用价格倍数限制: {self.price_multiplier or 0}倍
+3. 使用IOC限价单模式
+=============================""")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"打印策略失败: {str(e)}")
+            return False
 # =============================== 
 # 模块：测试功能
 # ===============================
-    async def test_center(self):  # 异步方法
+    async def test_center(self):
         """测试中心"""
         try:
             while True:
@@ -4897,11 +3938,8 @@ class OrderProcessor:
                 else:
                     print("无效的选择，请重新输入")
         except Exception as e:
-            logger.error(f"测试中心运行失败: {str(e)}")
+            self.logger.error(f"测试中心运行失败: {str(e)}")
             print(f"测试失败: {str(e)}")
-    except Exception as e:
-        logger.error(f"测试中心运行失败: {str(e)}")
-        print(f"测试失败: {str(e)}")
 
     async def _setup_websocket(self) -> bool:
         """建立WebSocket连接"""
@@ -5017,7 +4055,7 @@ class OrderProcessor:
             if not self.data_pool:
                 print("数据池未初始化")
                 return
-                
+            
             await self.data_pool.start(self.symbol)
             
             test_start = time.time()
@@ -5156,8 +4194,7 @@ class OrderProcessor:
   - 止损: -{self.stop_loss*100:.1f}%
 {chr(10).join([f'  - 止盈{i+1}: +{p*100:.1f}% 卖出{a*100:.1f}%' for i, (p, a) in enumerate(self.sell_strategy)])}
 """)
-            return True
-            
+            return True            
         except Exception as e:
             self.logger.error(f"加载策略失败: {str(e)}")
             return False
@@ -5213,74 +4250,11 @@ class OrderProcessor:
             self.logger.error(f"保存策略失败: {str(e)}")
             return False
 
-    async def setup_api_keys_async(self):
-        """异步设置API密钥"""
-        try:
-            print("\n=== API密钥设置 ===")
-            
-            # 检查是否已有API配置
-            if self.config.has_api_keys():
-                print("\n检测到已有API配置,正在测试连接...")
-                
-                try:
-                    # 测试交易API
-                    await asyncio.to_thread(self.trade_client.fetch_balance)
-                    print("✅ 交易API连接正常")
-                    
-                    # 测试查询API
-                    start_time = time.time()
-                    await asyncio.to_thread(self.query_client.fetch_time)
-                    latency = (time.time() - start_time) * 1000
-                    print(f"✅ 查询API连接正常 (延迟: {latency:.2f}ms)")
-                    
-                    # 询问是否要更换
-                    change = input("\n是否要更换API密钥? (y/n): ").strip().lower()
-                    if change != 'y':
-                        print("\nAPI设置未变更")
-                        return
-                        
-                except Exception as e:
-                    print(f"\n⚠️ 现有API测试失败: {str(e)}")
-            
-            # 设置新的API密钥
-            print("\n请输入新的API密钥:")
-            trade_key = input("交易API Key: ").strip()
-            trade_secret = input("交易API Secret: ").strip()
-            query_key = input("查询API Key: ").strip()
-            query_secret = input("查询API Secret: ").strip()
-            
-            # 保存API密钥
-            self.config.set_trade_api_keys(trade_key, trade_secret)
-            self.config.set_query_api_keys(query_key, query_secret)
-            
-            print("\n✅ API密钥已保存")
-            
-            # 重新初始化客户端并测试
-            if await self._init_clients():
-                print("\n正在测试新API连接...")
-                try:
-                    # 测试交易API
-                    await asyncio.to_thread(self.trade_client.fetch_balance)
-                    print("✅ 交易API连接正常")
-                    
-                    # 测试查询API
-                    start_time = time.time()
-                    await asyncio.to_thread(self.query_client.fetch_time)
-                    latency = (time.time() - start_time) * 1000
-                    print(f"✅ 查询API连接正常 (延迟: {latency:.2f}ms)")
-                except Exception as e:
-                    print(f"❌ API测试失败: {str(e)}")
-            else:
-                print("❌ API客户端初始化失败")
-            
-        except Exception as e:
-            self.logger.error(f"设置API密钥失败: {str(e)}")
-            print(f"\n❌ 设置失败: {str(e)}")
-
+    
     async def setup_snipe_strategy_async(self):
         """设置抢购策略"""
         try:
-            logger.info("开始设置抢购策略...")
+            self.logger.info("开始设置抢购策略...")  # 修改这里
             
             # 1. 基础设置
             print("\n>>> 基础参数设置")
@@ -5453,9 +4427,28 @@ class OrderProcessor:
             return True
             
         except Exception as e:
-            logger.error(f"设置抢购策略失败: {str(e)}")
+            self.logger.error(f"设置抢购策略失败: {str(e)}")
             return False
 
+    async def cancel_all_orders(self, symbol: str) -> int:
+        """撤销所有当前订单"""
+        try:
+            orders = await self.trade_client.fetch_open_orders(symbol)
+            canceled = 0
+            for order in orders:
+                await self.trade_client.cancel_order(order['id'], symbol)
+                canceled += 1
+                self.logger.info(f"已撤销订单: {order['id']}")
+            return canceled
+        except Exception as e:
+            self.logger.error(f"撤单失败: {str(e)}")
+            return 0
+
+    def setup_trading_pair(self, symbol: str, amount: float):
+        """设置交易对和数量"""
+        self.symbol = symbol
+        self.amount = amount
+        self.logger.info(f"设置交易对: {symbol}, 数量: {amount}")
 
 # =============================== 
 # 模块：main 主程序
@@ -5487,23 +4480,25 @@ async def main():
                 print("感谢使用，再见!")
                 break
             elif choice == '1':
-                await sniper.setup_api_keys_async()  # 改为异步
+                # 修改这里:使用异步方法
+                await sniper.setup_api_keys_async()  
             elif choice == '2':
-                await sniper.setup_snipe_strategy_async()  # 改为异步
+                await sniper.setup_snipe_strategy_async()
             elif choice == '3':
-                await sniper.print_strategy_async()  # 改为异步
+                # 先加载策略
+                if await sniper.load_strategy_async():  # 添加这行
+                    await sniper.print_strategy_async()
+                else:
+                    print("加载策略失败，请先设置策略")
             elif choice == '4':
-                # 完全异步的抢购流程
                 if not await sniper._init_clients():
                     print("请先配置API密钥")
                     continue
                     
-                # 初始化执行环境
                 if not await sniper._init_snipe():
                     print("初始化失败")
                     continue
                     
-                # 执行抢购
                 result = await sniper.execute_snipe()
                 if result:
                     print("\n✅ 抢购成功!")
@@ -5514,17 +4509,21 @@ async def main():
                     print("\n❌ 抢购失败")
                     
             elif choice == '5':
-                # 完全异步的测试中心
                 await sniper.test_center()
             else:
                 print("无效的选择，请重新输入")
                 
     except Exception as e:
-        print(f"程序运行出错: {str(e)}")
         logger.error(f"程序运行出错: {str(e)}")
     finally:
         if 'sniper' in locals():
             await sniper.cleanup()
+
+# 在文件开头的导入部分添加或修改
+class DepthAnalyzer:
+    """深度分析器"""
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
 
 if __name__ == '__main__':
     try:
@@ -5556,4 +4555,3 @@ if __name__ == '__main__':
         # 清理事件循环
         if loop.is_running():
             loop.close()
-
