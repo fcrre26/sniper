@@ -592,69 +592,147 @@ class TimeSync:
         self.sync_interval = 30  # 改为30秒同步一次
         self.min_samples = 5
         self.max_samples = 10
-        self._server_time = 0  # 添加服务器时间缓存
+        self._server_time = 0
         
-    async def get_server_time(self) -> int:
-        """获取币安服务器时间"""
+    def _filter_outliers(self, measurements: List[Dict]) -> List[Dict]:
+        """过滤异常值
+        Args:
+            measurements: 包含测量数据的字典列表
+        Returns:
+            List[Dict]: 过滤后的测量结果
+        """
+        if len(measurements) < 3:
+            return measurements
+            
+        # 按延迟排序
+        sorted_measurements = sorted(measurements, key=lambda x: x['latency'])
+        
+        # 计算四分位数
+        n = len(sorted_measurements)
+        q1_idx = n // 4
+        q3_idx = (n * 3) // 4
+        
+        q1 = sorted_measurements[q1_idx]['latency']
+        q3 = sorted_measurements[q3_idx]['latency']
+        iqr = q3 - q1
+        
+        # 定义异常值界限
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        
+        # 过滤异常值
+        filtered = [m for m in sorted_measurements 
+                   if lower_bound <= m['latency'] <= upper_bound]
+        
+        return filtered if filtered else sorted_measurements[:3]
+
+    async def sync(self) -> Optional[Tuple[float, float, int]]:
+        """异步同步时间，获取网络延迟和服务器时间"""
+        try:
+            measurements = []
+            logger.info("开始时间同步测量...")
+            
+            # 1. 快速预检
+            initial_time = await self.get_server_time()
+            if not initial_time:
+                logger.error("预检失败：无法连接到币安服务器")
+                return None
+                
+            # 2. 批量收集样本
+            successful_samples = 0
+            for i in range(self.max_samples):
+                try:
+                    # 精确计时
+                    start = time.time() * 1000  # 改用 time.time() 获取当前时间戳
+                    server_time = await self.get_server_time()
+                    end = time.time() * 1000
+                    
+                    if not server_time:
+                        logger.warning(f"样本{i+1}/{self.max_samples}: 获取服务器时间失败")
+                        continue
+                    
+                    # 计算延迟
+                    rtt = end - start  # 直接计算往返时间
+                    latency = rtt / 2
+                    
+                    # 计算时间偏移 (修正后的逻辑)
+                    time_offset = server_time - (start + latency)  # 服务器时间与本地时间的差值
+                    
+                    measurements.append({
+                        'server_time': server_time,
+                        'latency': latency,
+                        'rtt': rtt,
+                        'offset': time_offset
+                    })
+                    
+                    successful_samples += 1
+                    logger.debug(
+                        f"样本{i+1}: 延迟={latency:.2f}ms, "
+                        f"RTT={rtt:.2f}ms, "
+                        f"偏移={time_offset:.2f}ms"
+                    )
+                    
+                    # 如果已经收集到足够的样本，可以提前结束
+                    if successful_samples >= self.min_samples:
+                        await asyncio.sleep(0.1)  # 最后一次等待确保数据稳定
+                        break
+                        
+                    await asyncio.sleep(0.1)  # 采样间隔
+                    
+                except Exception as e:
+                    logger.error(f"样本{i+1}采集异常: {str(e)}")
+                    continue
+            
+            # 3. 样本分析
+            if len(measurements) < self.min_samples:
+                logger.error(
+                    f"样本不足: 获得{len(measurements)}个, "
+                    f"需要{self.min_samples}个"
+                )
+                return None
+                
+            # 4. 过滤异常值
+            filtered = self._filter_outliers(measurements)
+            logger.info(
+                f"样本统计: 总计={len(measurements)}, "
+                f"有效={len(filtered)}, "
+                f"过滤={len(measurements)-len(filtered)}"
+            )
+            
+            if len(filtered) < self.min_samples:
+                logger.error(f"过滤后样本不足: {len(filtered)}/{self.min_samples}")
+                return None
+            
+            # 5. 计算最终结果
+            self.network_latency = statistics.median(m['latency'] for m in filtered)
+            self._server_time = statistics.median(m['server_time'] for m in filtered)
+            time_offset = statistics.median(m['offset'] for m in filtered)
+            self.last_sync_time = self._server_time
+            
+            logger.info(
+                f"同步完成: 延迟={self.network_latency:.2f}ms, "
+                f"偏移={time_offset:.2f}ms, "
+                f"样本数={len(filtered)}"
+            )
+            
+            return (self.network_latency, time_offset, int(self._server_time))
+            
+        except Exception as e:
+            logger.error(f"时间同步过程异常: {str(e)}")
+            return None
+
+    async def get_server_time(self) -> Optional[int]:
+        """异步获取服务器时间"""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get('https://api.binance.com/api/v3/time', timeout=2) as response:
                     if response.status == 200:
                         result = await response.json()
-                        return result['serverTime']  # 毫秒时间戳
+                        return result['serverTime']
         except Exception as e:
             logger.error(f"获取服务器时间失败: {str(e)}")
             return None
 
-    async def sync(self) -> bool:
-        """同步时间"""
-        try:
-            measurements = []
-            
-            # 收集多个样本
-            for _ in range(self.max_samples):
-                start = time.perf_counter_ns()
-                server_time = await self.get_server_time()
-                if not server_time:
-                    continue
-                    
-                end = time.perf_counter_ns()
-                
-                rtt = (end - start) / 1e6  # 转换为毫秒
-                latency = rtt / 2
-                
-                measurements.append({
-                    'server_time': server_time,
-                    'latency': latency,
-                    'rtt': rtt
-                })
-                
-                await asyncio.sleep(0.1)
-            
-            # 过滤异常值
-            filtered = self._filter_outliers(measurements)
-            if len(filtered) < self.min_samples:
-                return False
-                
-            # 使用中位数
-            self.network_latency = statistics.median(m['latency'] for m in filtered)
-            self._server_time = statistics.median(m['server_time'] for m in filtered)
-            self.last_sync_time = self._server_time
-            
-            # 修改日志格式
-            self.logger.info(f"""
-=== 时间同步完成 ===
-• 总耗时: {total_time:.2f}ms
-• 网络延迟: {self.network_latency:.2f}ms
-• 时间偏移: {self.server_time_offset:.2f}ms
-""")
-            
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"时间同步失败: {str(e)}")
-            return False
-    
     def get_current_time(self) -> int:
         """获取当前服务器时间(毫秒)"""
         if not self._server_time:
@@ -1167,8 +1245,22 @@ class BinanceSniper:
         self.query_client = None
         self.timezone = pytz.timezone('Asia/Shanghai')
         
+        # 添加 time_sync 初始化
+        self.time_sync = TimeSync()
+        
+        # 添加 market_data 初始化
+        self.market_data = {
+            'network_latency': 0,
+            'time_offset': 0,
+            'server_time': 0,
+            'current_price': 0,
+            'price_24h_change': 0,
+            'volume_24h': 0,
+            'market_status': '未知'
+        }
+        
         # 修改这行: 使用 PerformanceAnalyzer 替代 PerformanceTimer
-        self.perf = PerformanceAnalyzer()  # 修改这里
+        self.perf = PerformanceAnalyzer()
         
         # 添加网络和时间相关属性初始化
         self.network_latency = 0
@@ -1192,32 +1284,34 @@ class BinanceSniper:
         # 初始化基本组件
         self._init_basic_components()
         
-        # 统一管理市场数据
-        self.market_data = {
-            'network_latency': 0,
-            'time_offset': 0,
-            'server_time': 0,
-            'current_price': 0,
-            'price_24h_change': 0,
-            'volume_24h': 0,
-            'market_status': '未知'
-        }
     async def update_market_data(self):
         """更新市场数据"""
         try:
             # 更新价格信息
             if self.query_client:
                 try:
-                    ticker = await self.query_client.fetch_ticker(self.symbol)
-                    self.market_data.update({
-                        'current_price': ticker['last'],
-                        'price_24h_change': ticker['percentage'],
-                        'volume_24h': ticker['quoteVolume'],
-                    })
+                    # 使用异步会话获取数据
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(
+                            f'https://api.binance.com/api/v3/ticker/24hr?symbol={self.symbol.replace("/", "")}'
+                        ) as response:
+                            if response.status == 200:
+                                ticker = await response.json()
+                                self.market_data.update({
+                                    'current_price': float(ticker['lastPrice']),
+                                    'price_24h_change': float(ticker['priceChangePercent']),
+                                    'volume_24h': float(ticker['quoteVolume']),
+                                    'market_status': '正常交易'
+                                })
+                            else:
+                                raise Exception(f"获取行情失败: {response.status}")
                 except Exception as e:
                     self.logger.error(f"获取价格信息失败: {str(e)}")
                     self.market_data.update({
-                        'market_status': '正常交易'
+                        'market_status': '未知',
+                        'current_price': 0,
+                        'price_24h_change': 0,
+                        'volume_24h': 0
                     })
             
             # 更新网络和时间信息
@@ -3414,33 +3508,6 @@ f"最终时间同步完成: {sync_time:.2f}ms"  # 正确：整个字符串在引
             
         except Exception as e:
             self.logger.error(f"设置抢购策略失败: {str(e)}")
-            return False
-
-    async def update_market_data(self):
-        """更新市场数据"""
-        try:
-            # 更新价格信息
-            if self.query_client:
-                ticker = await self.query_client.fetch_ticker(self.symbol)
-                self.market_data.update({
-                    'current_price': ticker['last'],
-                    'price_24h_change': ticker['percentage'],
-                    'volume_24h': ticker['quoteVolume'],
-                    'market_status': '正常交易'
-                })
-            
-            # 更新网络和时间信息
-            time_sync_result = await self.time_sync.sync()
-            if time_sync_result:
-                self.market_data.update({
-                    'network_latency': time_sync_result[0],
-                    'time_offset': time_sync_result[1],
-                    'server_time': time_sync_result[2]
-                })
-                
-            return True
-        except Exception as e:
-            self.logger.error(f"更新市场数据失败: {str(e)}")
             return False
 
 # =============================== 
