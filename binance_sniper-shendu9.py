@@ -230,27 +230,33 @@ class DataPool:
     def __init__(self):
         self.lock = asyncio.Lock()
         
+        # 整合后的最新数据
+        self._latest_data = {
+            'current_price': 0,
+            'price_24h_change': 0,
+            'volume_24h': 0,
+            'market_status': 'unknown',
+            'timestamp': 0,
+            'network_latency': 0,
+            'time_offset': 0,
+            'server_time': 0
+        }
+        
         # 价格数据缓存
         self.price_cache = {
             'ws_data': deque(maxlen=1000),    # WebSocket价格数据
             'rest_data': deque(maxlen=1000),   # REST价格数据
-            'last_update': 0,                  # 最后更新时间
+            'last_update': 0
         }
         
         # 深度数据缓存
         self.depth_cache = {
-            'ws_data': {
-                'bids': {},  # 买单深度
-                'asks': {}   # 卖单深度
-            },
-            'rest_data': {
-                'bids': {},
-                'asks': {}
-            },
+            'bids': {},  # 买单深度
+            'asks': {},  # 卖单深度
             'last_update': 0
         }
         
-        # 交易数据缓存
+        # 成交数据缓存
         self.trade_cache = {
             'recent_trades': deque(maxlen=1000),  # 最近成交
             'last_update': 0
@@ -258,98 +264,148 @@ class DataPool:
         
         # 统计数据
         self.stats = {
-            'ws_messages': 0,
-            'rest_updates': 0,
-            'cache_hits': 0,
-            'cache_misses': 0
+            'ws_messages': 0,      # WebSocket消息计数
+            'rest_updates': 0,     # REST更新计数
+            'cache_hits': 0,       # 缓存命中次数
+            'cache_misses': 0,     # 缓存未命中次数
+            'errors': 0            # 错误计数
         }
 
     async def update_price(self, data: dict, source: str = 'ws'):
-        """更新价格数据"""
+        """更新价格数据并立即整合"""
         async with self.lock:
-            if source == 'ws':
-                self.price_cache['ws_data'].append(data)
-                self.stats['ws_messages'] += 1
-            else:
-                self.price_cache['rest_data'].append(data)
-                self.stats['rest_updates'] += 1
-            
-            self.price_cache['last_update'] = time.time() * 1000
+            try:
+                # 更新原始数据缓存
+                if source == 'ws':
+                    self.price_cache['ws_data'].append(data)
+                    self.stats['ws_messages'] += 1
+                else:
+                    self.price_cache['rest_data'].append(data)
+                    self.stats['rest_updates'] += 1
+                
+                # 立即整合最新数据
+                self._latest_data.update({
+                    'current_price': float(data.get('price', 0)),
+                    'price_24h_change': float(data.get('priceChangePercent', 0)),
+                    'volume_24h': float(data.get('volume', 0)),
+                    'market_status': 'normal' if float(data.get('price', 0)) > 0 else 'unknown',
+                    'timestamp': int(data.get('time', time.time() * 1000))
+                })
+                
+                self.price_cache['last_update'] = time.time() * 1000
+                
+            except Exception as e:
+                self.stats['errors'] += 1
+                logger.error(f"更新价格数据失败: {str(e)}")
 
-    async def update_depth(self, data: dict, source: str = 'ws'):
+    async def update_depth(self, data: dict):
         """更新深度数据"""
         async with self.lock:
-            target = self.depth_cache['ws_data' if source == 'ws' else 'rest_data']
-            
-            # 更新买单深度
-            for price, amount in data.get('bids', []):
-                if float(amount) > 0:
-                    target['bids'][price] = amount
-                else:
-                    target['bids'].pop(price, None)
-                    
-            # 更新卖单深度
-            for price, amount in data.get('asks', []):
-                if float(amount) > 0:
-                    target['asks'][price] = amount
-                else:
-                    target['asks'].pop(price, None)
-                    
-            self.depth_cache['last_update'] = time.time() * 1000
-            
-            if source == 'ws':
-                self.stats['ws_messages'] += 1
-            else:
-                self.stats['rest_updates'] += 1
+            try:
+                # 更新买单深度
+                for price, amount in data.get('bids', []):
+                    if float(amount) > 0:
+                        self.depth_cache['bids'][price] = amount
+                    else:
+                        self.depth_cache['bids'].pop(price, None)
+                        
+                # 更新卖单深度
+                for price, amount in data.get('asks', []):
+                    if float(amount) > 0:
+                        self.depth_cache['asks'][price] = amount
+                    else:
+                        self.depth_cache['asks'].pop(price, None)
+                        
+                self.depth_cache['last_update'] = time.time() * 1000
+                
+            except Exception as e:
+                self.stats['errors'] += 1
+                logger.error(f"更新深度数据失败: {str(e)}")
 
-    async def update_trades(self, trades: list):
-        """更新最近成交"""
+    async def update_trades(self, trade: dict):
+        """更新成交数据"""
         async with self.lock:
-            for trade in trades:
+            try:
                 self.trade_cache['recent_trades'].append(trade)
-            self.trade_cache['last_update'] = time.time() * 1000
-            self.stats['rest_updates'] += 1
+                self.trade_cache['last_update'] = time.time() * 1000
+            except Exception as e:
+                self.stats['errors'] += 1
+                logger.error(f"更新成交数据失败: {str(e)}")
 
-    def get_latest_price(self) -> Optional[float]:
-        """获取最新价格"""
-        if self.price_cache['ws_data']:
-            self.stats['cache_hits'] += 1
-            return float(self.price_cache['ws_data'][-1]['price'])
-        elif self.price_cache['rest_data']:
-            self.stats['cache_hits'] += 1
-            return float(self.price_cache['rest_data'][-1]['price'])
-        self.stats['cache_misses'] += 1
-        return None
+    async def update_network_stats(self, latency: float, offset: float, server_time: int):
+        """更新网络状态数据"""
+        async with self.lock:
+            try:
+                self._latest_data.update({
+                    'network_latency': latency,
+                    'time_offset': offset,
+                    'server_time': server_time
+                })
+            except Exception as e:
+                self.stats['errors'] += 1
+                logger.error(f"更新网络状态失败: {str(e)}")
 
-    def get_depth(self, level: int = 20) -> dict:
+    async def get_latest_data(self) -> Optional[Dict]:
+        """获取最新市场数据"""
+        try:
+            async with self.lock:
+                self.stats['cache_hits'] += 1
+                return self._latest_data.copy()  # 返回副本避免外部修改
+        except Exception as e:
+            self.stats['cache_misses'] += 1
+            logger.error(f"获取最新市场数据失败: {str(e)}")
+            return None
+
+    async def get_depth(self, limit: int = 20) -> Dict:
         """获取市场深度"""
-        bids = sorted(self.depth_cache['ws_data']['bids'].items(), 
-                     key=lambda x: float(x[0]), reverse=True)[:level]
-        asks = sorted(self.depth_cache['ws_data']['asks'].items(), 
-                     key=lambda x: float(x[0]))[:level]
-        
-        return {
-            'bids': bids,
-            'asks': asks,
-            'timestamp': self.depth_cache['last_update']
-        }
+        async with self.lock:
+            try:
+                bids = sorted(self.depth_cache['bids'].items(), 
+                            key=lambda x: float(x[0]), reverse=True)[:limit]
+                asks = sorted(self.depth_cache['asks'].items(), 
+                            key=lambda x: float(x[0]))[:limit]
+                return {
+                    'bids': bids,
+                    'asks': asks,
+                    'timestamp': self.depth_cache['last_update']
+                }
+            except Exception as e:
+                self.stats['errors'] += 1
+                logger.error(f"获取深度数据失败: {str(e)}")
+                return {'bids': [], 'asks': [], 'timestamp': 0}
 
-    def get_recent_trades(self, limit: int = 100) -> list:
+    async def get_recent_trades(self, limit: int = 100) -> List:
         """获取最近成交"""
-        return list(self.trade_cache['recent_trades'])[-limit:]
+        async with self.lock:
+            try:
+                return list(self.trade_cache['recent_trades'])[-limit:]
+            except Exception as e:
+                self.stats['errors'] += 1
+                logger.error(f"获取成交数据失败: {str(e)}")
+                return []
 
-    def get_pool_stats(self) -> dict:
+    def get_stats(self) -> Dict:
         """获取数据池统计信息"""
         return {
             'ws_messages': self.stats['ws_messages'],
             'rest_updates': self.stats['rest_updates'],
             'cache_hits': self.stats['cache_hits'],
             'cache_misses': self.stats['cache_misses'],
+            'errors': self.stats['errors'],
             'price_cache_size': len(self.price_cache['ws_data']),
-            'depth_cache_size': len(self.depth_cache['ws_data']['bids']) + 
-                              len(self.depth_cache['ws_data']['asks']),
+            'depth_cache_size': len(self.depth_cache['bids']) + len(self.depth_cache['asks']),
             'trade_cache_size': len(self.trade_cache['recent_trades'])
         }
+
+    async def clear_cache(self):
+        """清理缓存数据"""
+        async with self.lock:
+            self.price_cache['ws_data'].clear()
+            self.price_cache['rest_data'].clear()
+            self.depth_cache['bids'].clear()
+            self.depth_cache['asks'].clear()
+            self.trade_cache['recent_trades'].clear()
+            logger.info("数据缓存已清理")
 
 # =============================== 
 # 模块：请求调度器
@@ -1241,9 +1297,19 @@ class BinanceSniper:
         """初始化币安抢币工具"""
         self.config = config
         self.logger = logging.getLogger(__name__)
+        self.timezone = pytz.timezone('Asia/Shanghai')
+        
+        # 初始化数据池和调度器
+        self.data_pool = DataPool()  # 先创建 data_pool
+        self.scheduler = RequestScheduler(data_pool=self.data_pool)
+        
+        # 初始化其他组件 - 修改这行，传入正确的参数
+        self.order_processor = OrderProcessor(config, self.data_pool, self)  # 传入正确的参数
+        self.time_sync = TimeSync()
+        
+        # 初始化API客户端
         self.trade_client = None
         self.query_client = None
-        self.timezone = pytz.timezone('Asia/Shanghai')
         
         # 添加 time_sync 初始化
         self.time_sync = TimeSync()
@@ -1276,10 +1342,6 @@ class BinanceSniper:
         self.stop_loss = None
         self.sell_strategy = None
         self.opening_time = None
-        
-        # 确保 DataPool 和 OrderProcessor 在初始化时就创建
-        self.data_pool = DataPool()
-        self.order_processor = OrderProcessor(config, self.data_pool, self)
         
         # 初始化基本组件
         self._init_basic_components()
@@ -1331,12 +1393,27 @@ class BinanceSniper:
     async def print_strategy_async(self):
         """代理到 OrderProcessor 的打印方法"""
         try:
+            # 先加载策略
+            if not await self.load_strategy_async():
+                self.logger.error("加载策略失败")
+                return False
+                
             # 更新市场数据
-            await self.update_market_data()
-            
+            if not await self.update_market_data():
+                self.logger.error("更新市场数据失败")
+                return False
+                
+            # 确保 OrderProcessor 已初始化
+            if not self.order_processor:
+                self.logger.error("OrderProcessor 未初始化")
+                return False
+                
             # 同步必要的属性到 OrderProcessor
             self.order_processor.query_client = self.query_client
             self.order_processor.trade_client = self.trade_client
+            self.order_processor.market_data = self.market_data
+            
+            # 同步策略相关属性
             self.order_processor.symbol = self.symbol
             self.order_processor.amount = self.amount
             self.order_processor.max_price_limit = self.max_price_limit
@@ -1374,6 +1451,27 @@ class BinanceSniper:
             self.logger.error(f"加载策略失败: {str(e)}")
             return False
 
+    async def _check_api_keys(self) -> bool:
+        """检查API密钥是否有效"""
+        try:
+            if not self.trade_client or not self.query_client:
+                self.logger.error("API客户端未初始化")
+                return False
+                
+            # 测试交易API
+            await asyncio.to_thread(self.trade_client.fetch_balance)
+            self.logger.info("交易API验证成功")
+            
+            # 测试查询API
+            await asyncio.to_thread(self.query_client.fetch_time)
+            self.logger.info("查询API验证成功")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"API密钥验证失败: {str(e)}")
+            return False
+
     async def _init_snipe(self) -> bool:
         """初始化抢购环境"""
         try:
@@ -1381,26 +1479,23 @@ class BinanceSniper:
             if not await self._check_api_keys():
                 return False
                 
-            # 2. 加载策略配置 - 改为异步
-            if not await self.load_strategy_async():  # 原来的 load_strategy() 改为异步
+            # 2. 检查交易对状态
+            if not await self.check_trading_status():
+                self.logger.error(f"交易对 {self.symbol} 不可交易")
                 return False
                 
-            # 3. 准备IP资源
-            if not await self.prepare_ips():
+            # 3. 加载策略配置
+            if not await self.load_strategy_async():
                 return False
                 
-            # 4. 验证IP可用性
-            if not await self.validate_ips():
+            # 4. 更新市场数据
+            if not await self.update_market_data():
                 return False
                 
-            # 5. 启动数据池
-            await self.data_pool.start(self.symbol)
-            
-            # 6. 同步时间
-            if not await self.sync_server_time():
+            # 5. 检查账户余额
+            if not await self.check_balance():
                 return False
                 
-            self.logger.info("初始化完成")
             return True
             
         except Exception as e:
@@ -1854,20 +1949,28 @@ class BinanceSniper:
         self.amount = amount
         logger.info(f"已设置交易对: {symbol}, 买入金额: {amount} USDT")
 
-    def check_balance(self) -> bool:
-        """检查账户余额（同步方法）"""
+    async def check_balance(self) -> bool:
+        """检查账户余额是否足够，只提示不中断"""
         try:
-            balance = self.query_client.fetch_balance()
-            quote_currency = self.symbol.split('/')[1]
-            available = balance[quote_currency]['free']
-            required = self.amount * (self.price or self.get_market_price())
-            
-            if available < required:
-                logger.error(f"余额不足: 需要 {required} {quote_currency}，实际可用 {available} {quote_currency}")
+            if not self.trade_client:
+                self.logger.error("交易客户端未初始化")
                 return False
+                
+            # 获取USDT余额
+            balance = await asyncio.to_thread(self.trade_client.fetch_balance)
+            usdt_free = float(balance.get('USDT', {}).get('free', 0))
+            
+            # 检查余额是否足够 - 只提示不中断
+            if usdt_free < self.amount:
+                self.logger.warning(f"⚠️ USDT余额不足: {usdt_free:.2f} < {self.amount:.2f}")
+                self.logger.info("继续等待开盘，请及时充值...")
+                return True  # 返回 True 让流程继续
+                
+            self.logger.info(f"USDT余额充足: {usdt_free:.2f}")
             return True
+            
         except Exception as e:
-            logger.error(f"检查余额失败: {str(e)}")
+            self.logger.error(f"检查余额失败: {str(e)}")
             return False
 
     def get_market_price(self) -> float:
@@ -1891,29 +1994,24 @@ class BinanceSniper:
         return True
 
     async def check_trading_status(self) -> bool:
-        """检查是否已开盘"""
+        """检查交易对是否可以交易"""
         try:
-            # 优先使用WebSocket数据
-            if self.ws_client and self.ws_client.is_connected():
-                market_data = await self.ws_client.get_market_data()
-                if market_data:
-                    self.opening_price = float(market_data['last'])
-                    logger.info(f"检测到开盘价: {self.opening_price}")
-                    return True
-            
-            # 回退到REST API
-            ticker = await self.query_client.fetch_ticker(self.symbol)
-            if ticker.get('last'):
-                self.opening_price = float(ticker['last'])
-                logger.info(f"检测到开盘价: {self.opening_price}")
+            # 如果是抢开盘交易，返回 True
+            if self.opening_time and self.opening_time > datetime.now(self.timezone):
+                self.logger.info(f"交易对 {self.symbol} 等待开盘")
                 return True
-            
-            # 检查订单簿
-            orderbook = await self.query_client.fetch_order_book(self.symbol, limit=1)
-            return bool(orderbook and orderbook['asks'])
-        
+                
+            # 已上市交易对检查
+            market_data = await self.data_pool.get_latest_data()
+            if market_data and market_data.get('current_price', 0) > 0:
+                self.logger.info(f"交易对 {self.symbol} 可交易，当前价格: {market_data['current_price']}")
+                return True
+                
+            self.logger.warning(f"交易对 {self.symbol} 状态异常")
+            return False
+                
         except Exception as e:
-            logger.error(f"检查交易状态失败: {str(e)}")
+            self.logger.error(f"检查交易状态失败: {str(e)}")
             return False
 
     def set_price_protection(self, max_price: float = None, price_multiplier: float = None):
@@ -2366,19 +2464,43 @@ class BinanceSniper:
             if not await self._init_snipe():
                 return None
             
-            # 2. 同步时间
+            # 2. 检查是否需要等待开盘
+            if self.opening_time and self.opening_time > datetime.now(self.timezone):
+                self.logger.info(f"""
+=== 等待开盘 ===
+交易对: {self.symbol}
+开盘时间: {self.opening_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)
+买入金额: {self.amount} USDT
+最高限价: {self.max_price_limit} USDT
+""")
+                
+                while datetime.now(self.timezone) < self.opening_time:
+                    # 计算剩余时间
+                    remaining = self.opening_time - datetime.now(self.timezone)
+                    hours, remainder = divmod(remaining.seconds, 3600)
+                    minutes, seconds = divmod(remainder, 60)
+                    
+                    # 每10秒更新一次状态
+                    self.logger.info(f"距离开盘还有: {hours}小时{minutes}分{seconds}秒")
+                    await asyncio.sleep(10)
+                    
+                    # 更新市场数据和余额
+                    await self.update_market_data()
+                    await self.check_balance()
+                
+            # 3. 同步时间
             sync_results = await self.sync_time()
             if not sync_results:
-                logger.error("时间同步失败")
+                self.logger.error("时间同步失败")
                 return None
                 
-            # 3. 计算发送时间
+            # 4. 计算发送时间
             send_time = self._calculate_send_time(sync_results)
             if not send_time:
-                logger.error("发送时间计算失败")
+                self.logger.error("发送时间计算失败")
                 return None
                 
-            # 4. 准备订单参数
+            # 5. 准备订单参数
             params = {
                 'symbol': self.symbol.replace('/', ''),
                 'side': 'BUY',
@@ -2389,53 +2511,23 @@ class BinanceSniper:
                 'timestamp': int(time.time() * 1000)
             }
             
-            # 5. 等待直到发送时间
+            # 6. 等待直到发送时间
             current_ms = time.time() * 1000
             if current_ms < send_time:
                 await asyncio.sleep((send_time - current_ms) / 1000)
                 
-            # 6. 执行订单
+            # 7. 执行订单
             result = await self._execute_order_async(params)
             if result and result.get('orderId'):
-                logger.info(f"订单执行成功: {result['orderId']}")
+                self.logger.info(f"订单执行成功: {result['orderId']}")
                 return result
             else:
-                logger.error("订单执行失败")
+                self.logger.error("订单执行失败")
                 return None
             
         except Exception as e:
-            logger.error(f"抢购执行失败: {str(e)}")
+            self.logger.error(f"抢购执行失败: {str(e)}")
             return None
-
-    async def _init_snipe(self):
-        """初始化抢购准备"""
-        try:
-            # 1. 检查市场状态
-            status = await self.check_symbol_status()
-            if not status['active']:
-                logger.error(f"交易对状态异常: {status['msg']}")
-                return False
-
-            # 2. 准备IP资源
-            if not await self.prepare_ips():
-                logger.error("IP资源准备失败")
-                return False
-
-            # 3. 验证IP可用性
-            if not await self.validate_ips():
-                logger.error("IP验证失败")
-                return False
-
-            # 4. 建立WebSocket连接
-            if not await self._setup_websocket():
-                logger.error("WebSocket连接失败")
-                return False
-
-            return True
-
-        except Exception as e:
-            logger.error(f"初始化失败: {str(e)}")
-            return False
 
     async def _execute_order_async(self, params):
         """异步执行订单"""
@@ -3483,17 +3575,34 @@ f"最终时间同步完成: {sync_time:.2f}ms"  # 正确：整个字符串在引
             self.logger.error(f"订单执行异常: {str(e)}")  # 修改这里
             return None
 
-    async def execute_snipe(self):
-        """执行抢购主逻辑"""
+    async def execute_snipe(self) -> bool:
+        """执行抢购"""
         try:
-            return await self.order_processor.execute_orders(
-                symbol=self.symbol,
-                amount=self.amount,
-                price=self.max_price_limit
-            )
+            # 初始化环境
+            if not await self._init_snipe():
+                return False
+                
+            # 开始抢购
+            self.logger.info("开始抢购...")
+            
+            # 等待开盘时间
+            await self.wait_for_opening()
+            
+            # 执行抢购订单
+            result = await self.place_snipe_orders()
+            
+            if result:
+                self.logger.info("抢购成功!")
+                return True
+            else:
+                self.logger.error("抢购失败")
+                return False
+                
         except Exception as e:
-            self.logger.error(f"抢购执行失败: {str(e)}")
-            return None
+            self.logger.error(f"抢购执行异常: {str(e)}")
+            return False
+        finally:
+            await self.cleanup()  # 确保资源被清理
 
     # 添加这个代理方法
     async def setup_snipe_strategy_async(self):
@@ -3889,17 +3998,22 @@ IP分配:
             
             # 获取当前时间和剩余时间
             now = datetime.now(self.timezone)
-            if hasattr(self, 'opening_time'):
-                time_diff = self.opening_time - now
-                hours_remaining = time_diff.total_seconds() / 3600
-            else:
-                hours_remaining = 0
-            
+            time_diff = self.opening_time - now
+            hours_remaining = time_diff.total_seconds() / 3600
+
             # 计算实际的提前时间
             advance_time = (
                 market_data['network_latency'] +  # 网络延迟
                 abs(market_data['time_offset']) +  # 时间偏移
                 5  # 安全冗余
+            )
+
+            # 修改这部分：买入数量显示逻辑
+            current_price = market_data['current_price']
+            estimated_amount = (
+                f"{self.amount/current_price:.8f} BTC (估算)" 
+                if current_price > 0 
+                else "待定 (以实际开盘价为准)"
             )
 
             print(f"""
@@ -3908,7 +4022,8 @@ IP分配:
 📌 基础参数
 - 交易对: {self.symbol or '未设置'}
 - 买入金额: {self.amount or 0:,.2f} USDT
-- 买入数量: {"待定" if market_data['current_price'] == 0 else f"{self.amount/market_data['current_price']:.8f} {self.symbol.split('/')[0] if self.symbol else ''}"}
+- 买入数量: {estimated_amount}
+- 说明: 实际买入数量将根据开盘价动态计算
 
 📊 市场信息
 - 币种状态: {market_data['market_status']}
