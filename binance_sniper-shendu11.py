@@ -58,7 +58,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 # 其他工具
-import ccxt
+import ccxt.async_support as ccxt_async
 import pytz
 import netifaces
 import psutil
@@ -1950,6 +1950,7 @@ class APIKeyManager:
                 keys = self.keys[key_type]
                 return keys['api_key'], keys['api_secret']
             
+            # 如果没有指定key_type，返回所有密钥的掩码版本
             return {
                 key_type: {
                     'key': mask_api_key(keys['api_key'])
@@ -1957,6 +1958,7 @@ class APIKeyManager:
                 for key_type, keys in self.keys.items()
                 if keys['api_key']
             }
+            
         except Exception as e:
             self.logger.error(f"获取API密钥失败: {str(e)}")
             return None
@@ -2378,29 +2380,264 @@ class TimeSync:
 class BinanceSniper:
     """币安现货抢币主控制类"""
     def __init__(self, config_file: str):
-        self.logger = logging.getLogger(__name__)
+        """初始化币安抢币工具"""
+        # 基础配置
         self.config_file = config_file
+        self.config = ConfigManager(config_file)
+        self.logger = logging.getLogger(__name__)
+        self.timezone = pytz.timezone('Asia/Shanghai')
+        
+        # 工具组件
         self.printer = PrintManager()
         
+        # API客户端
+        self.trade_client = None
+        self.query_client = None
+        
         # 运行状态
+        self.init_lock = asyncio.Lock()
         self.is_running = False
         self.start_time = 0
         
-        # 组件实例
-        self.config = None          # 配置管理器
-        self.data_cache = None      # 数据缓存
-        self.cache_manager = None   # 缓存管理
-        self.market_monitor = None  # 市场监控
-        self.order_executor = None  # 订单执行器
-        self.ws_manager = None      # WebSocket管理器
-        self.perf_monitor = None    # 性能监控
-        self.test_center = None     # 测试中心
+        # 功能组件
+        self.data_pool = DataPool()
+        self.market_monitor = None
+        self.order_executor = None
+        self.ws_manager = None
+        self.perf_monitor = None
+        self.test_center = None
         
         # 任务管理
         self.tasks = []
-        
-        # 初始化锁
-        self.init_lock = asyncio.Lock()
+        self._session: Optional[aiohttp.ClientSession] = None
+
+    async def _init_clients(self) -> bool:
+        """初始化API客户端"""
+        try:
+            # 获取API密钥
+            trade_keys = await self.config.api_manager.get_api_keys('trade')
+            query_keys = await self.config.api_manager.get_api_keys('query')
+            
+            if not trade_keys or not query_keys:
+                self.logger.error("未设置API密钥")
+                return False
+            
+            # 如果已存在客户端，先关闭它们
+            if self.trade_client:
+                await self.trade_client.close()
+            if self.query_client:
+                await self.query_client.close()
+            
+            # 初始化交易客户端
+            self.trade_client = ccxt_async.binance({
+                'apiKey': trade_keys[0],
+                'secret': trade_keys[1],
+                'enableRateLimit': True
+            })
+            
+            # 初始化查询客户端
+            self.query_client = ccxt_async.binance({
+                'apiKey': query_keys[0],
+                'secret': query_keys[1],
+                'enableRateLimit': True
+            })
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"初始化API客户端失败: {str(e)}")
+            return False
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """获取或创建 session"""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+    async def setup_snipe_strategy_async(self):
+        """设置抢购策略"""
+        try:
+            print("\n=== 抢购策略设置 ===")
+            
+            # 1. 基础参数设置
+            symbol = input("请输入交易对 (例如 BTC): ").strip().upper()
+            amount = float(input("请输入买入金额 (USDT): ").strip())
+            
+            # 2. 开盘时间设置
+            print("\n>>> 开盘时间设置")
+            print("请输入开盘时间 (东八区/北京时间)\n")
+            
+            # 获取当前时间
+            current_time = None
+            try:
+                session = await self._get_session()
+                async with session.get('https://api.binance.com/api/v3/time') as response:
+                    data = await response.json()
+                    server_time_ms = data['serverTime']
+                    current_time = datetime.fromtimestamp(server_time_ms/1000, self.timezone)
+            except Exception as e:
+                self.logger.error(f"获取服务器时间失败: {str(e)}")
+                current_time = datetime.now(self.timezone)
+                print("⚠️ 无法获取服务器时间，使用本地时间作为参考")
+                
+            print(f"当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
+            
+            # 循环直到获取有效时间
+            while True:
+                try:
+                    year = int(input("年 (例如 2024): ").strip())
+                    month = int(input("月 (1-12): ").strip())
+                    day = int(input("日 (1-31): ").strip())
+                    hour = int(input("时 (0-23): ").strip())
+                    if not 0 <= hour <= 23:
+                        print("小时必须在0-23之间")
+                        continue
+                    minute = int(input("分 (0-59): ").strip())
+                    second = int(input("秒 (0-59): ").strip())
+                    
+                    opening_time = datetime(year, month, day, hour, minute, second, tzinfo=self.timezone)
+                    break
+                except ValueError as e:
+                    print(f"❌ 错误: {str(e)}")
+                    continue
+            
+            # 显示时间信息
+            print("\n=== 时间信息 ===")
+            print(f"设置开盘时间: {opening_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
+            print(f"当前服务器时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
+            
+            time_diff = opening_time - current_time
+            hours_remaining = time_diff.total_seconds() / 3600
+            print(f"距离开盘还有: {hours_remaining:.1f}小时")
+            
+            if input("\n确认使用这个开盘时间? (yes/no): ").strip().upper() != "YES":
+                print("\n取消设置")
+                return False
+                
+            # 3. 价格保护和止盈止损设置
+            print("\n>>> 价格和止盈止损设置")
+            print("价格保护机制说明:")
+            print("1. 最高接受单价: 绝对价格上限，无论如何都不会超过此价格")
+            print("2. 开盘价倍数: 相对于第一档价格的最大倍数")
+            max_price = float(input("设置最高接受单价 (USDT): ").strip())
+            price_multiplier = float(input("设置开盘价倍数 (例如 3 表示最高接受开盘价的3倍): ").strip())
+            
+            # 设置止损
+            stop_loss = float(input("\n请输入止损比例 (%): ").strip())
+            
+            # 4. 设置止盈策略
+            print("\n设置阶梯止盈 (最多5档):")
+            sell_strategy = []
+            remaining_percent = 100.0
+            
+            for i in range(5):  # 最多5档
+                if remaining_percent <= 0:
+                    break
+                    
+                print(f"\n当前剩余可设置比例: {remaining_percent}%")
+                profit_input = input(f"第{i+1}档止盈比例 (%, 直接回车结束): ").strip()
+                
+                if not profit_input:  # 用户直接回车
+                    if i == 0:  # 第一档必须设置
+                        print("❌ 错误: 至少需要设置一档止盈!")
+                        continue
+                    break
+                    
+                try:
+                    profit_percent = float(profit_input)
+                    if profit_percent <= 0:
+                        print("❌ 错误: 止盈比例必须大于0")
+                        continue
+                        
+                    amount_percent = float(input(f"第{i+1}档卖出比例 (%): ").strip())
+                    if amount_percent <= 0 or amount_percent > remaining_percent:
+                        print(f"❌ 错误: 卖出比例不能超过剩余可设置比例 {remaining_percent}%")
+                        continue
+                        
+                    sell_strategy.append((profit_percent/100, amount_percent/100))
+                    remaining_percent -= amount_percent
+                    
+                except ValueError:
+                    print("❌ 错误: 请输入有效的数字")
+                    continue
+            
+            if not sell_strategy:
+                print("❌ 错误: 未设置任何止盈策略")
+                return False
+                
+            # 5. 显示完整策略确认
+            print("\n=== 策略确认 ===")
+            print(f"交易对: {symbol}USDT")
+            print(f"买入金额: {amount} USDT")
+            print("\n价格保护:")
+            print(f"- 最高限价: {max_price} USDT")
+            print(f"- 开盘价倍数: {price_multiplier}倍")
+            print(f"\n止损设置: -{stop_loss}%")
+            print("\n止盈策略:")
+            for i, (profit, amount) in enumerate(sell_strategy, 1):
+                print(f"- 第{i}档: 涨幅{profit*100:.0f}% 卖出{amount*100:.0f}%")
+            print("\n时间信息:")
+            print(f"开盘时间: {opening_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
+            print(f"当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
+            print(f"距离开盘: {hours_remaining:.1f}小时")
+            
+            if input("\n确认使用以上策略? (yes/no): ").strip().upper() != "YES":
+                print("\n取消设置")
+                return False
+                
+            # 6. 保存策略
+            strategy = {
+                'symbol': f"{symbol}USDT",
+                'amount': float(amount),  # 确保是浮点数
+                'max_price_limit': float(max_price),
+                'price_multiplier': float(price_multiplier),
+                'opening_time': opening_time.isoformat(),
+                'sell_strategy': sell_strategy,
+                'stop_loss': float(stop_loss)/100,  # 转换为小数
+                'concurrent_orders': 3  # 添加默认值
+            }
+
+            # 显示策略确认信息
+            print("\n=== 策略确认 ===")
+            print(f"交易对: {strategy['symbol']}")
+            print(f"买入金额: {strategy['amount']:,.1f} USDT")
+            print(f"\n价格保护:")
+            print(f"- 最高限价: {strategy['max_price_limit']:,.1f} USDT")
+            print(f"- 开盘价倍数: {strategy['price_multiplier']:.1f}倍")
+            print(f"\n止损设置: -{stop_loss:.1f}%")
+            
+            print("\n止盈策略:")
+            for i, (profit, amount) in enumerate(strategy['sell_strategy'], 1):
+                print(f"- 第{i}档: 涨幅{profit*100:.0f}% 卖出{amount*100:.0f}%")
+            
+            print(f"\n时间信息:")
+            opening_time_local = opening_time.astimezone(self.timezone)
+            now_local = datetime.now(self.timezone)
+            time_diff = opening_time_local - now_local
+            hours_remaining = time_diff.total_seconds() / 3600
+            
+            print(f"开盘时间: {opening_time_local.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
+            print(f"当前时间: {now_local.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
+            print(f"距离开盘: {hours_remaining:.1f}小时")
+
+            # 确认策略
+            confirm = input("\n确认使用以上策略? (yes/no): ").strip().upper()
+            if confirm != 'YES':
+                print("\n❌ 已取消策略设置")
+                return False
+
+            # 保存策略到文件
+            config_path = os.path.join(CONFIG_DIR, 'snipe_strategy.json')
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(strategy, f, indent=4, ensure_ascii=False)
+
+            print("\n✅ 策略设置成功!")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"设置策略失败: {str(e)}")
+            print(f"\n❌ 设置失败: {str(e)}")
+            return False
 
     async def initialize(self) -> bool:
         """初始化系统"""
@@ -2411,36 +2648,22 @@ class BinanceSniper:
                     
                 self.logger.info("开始初始化系统...")
                 
-                # 初始化配置管理器
-                self.config = ConfigManager(self.config_file)
+                # 初始化 session
+                self._session = await self._get_session()
                 
-                # 初始化数据缓存
+                # 加载API密钥
+                config_path = '/root/config/binance_api.json'
+                if os.path.exists(config_path):
+                    with open(config_path, 'r') as f:
+                        api_config = json.load(f)
+                        # 初始化API客户端
+                        if not await self._init_clients():
+                            self.logger.error("初始化API客户端失败")
+                            return False
+                
+                # 初始化其他组件 - 仅在需要时初始化
                 self.data_cache = MarketDataCache()
-                
-                # 初始化缓存管理器
                 self.cache_manager = CacheManager(self.data_cache)
-                await self.cache_manager.start()
-                
-                # 初始化市场监控
-                self.market_monitor = MarketMonitor(self.data_cache)
-                await self.market_monitor.start_monitoring()
-                
-                # 初始化订单执行器
-                self.order_executor = OrderExecutor(
-                    data_cache=self.data_cache,
-                    config=self.config
-                )
-                
-                # 初始化WebSocket管理器
-                self.ws_manager = WebSocketManager(self.data_pool)
-                await self.ws_manager.start()
-                
-                # 初始化性能监控
-                self.perf_monitor = PerformanceMonitor()
-                await self.perf_monitor.start()
-                
-                # 初始化测试中心
-                self.test_center = TestCenter(self)
                 
                 # 更新运行状态
                 self.is_running = True
@@ -2455,36 +2678,36 @@ class BinanceSniper:
 
     async def stop(self):
         """停止系统"""
-        try:
-            if not self.is_running:
-                return
-                
-            self.logger.info("开始停止系统...")
+        if not self.is_running:
+            return
             
-            # 停止所有组件
-            if self.ws_manager:
-                await self.ws_manager.stop()
+        self.is_running = False
+        
+        # 停止所有组件
+        if self.ws_manager:
+            await self.ws_manager.stop()
+        
+        if self.market_monitor:
+            await self.market_monitor.stop_monitoring()
             
-            if self.market_monitor:
-                await self.market_monitor.stop_monitoring()
-                
-            if self.cache_manager:
-                await self.cache_manager.stop()
-                
-            if self.perf_monitor:
-                await self.perf_monitor.stop()
-                
-            # 取消所有任务
-            for task in self.tasks:
-                task.cancel()
-                
-            # 更新状态
-            self.is_running = False
+        if self.cache_manager:
+            await self.cache_manager.stop()
             
-            self.logger.info("系统已停止")
+        if self.perf_monitor:
+            await self.perf_monitor.stop()
             
-        except Exception as e:
-            self.logger.error(f"停止系统失败: {str(e)}")
+        # 取消所有任务
+        for task in self.tasks:
+            task.cancel()
+            
+        # 关闭所有客户端
+        if self.trade_client:
+            await self.trade_client.close()
+            
+        if self.query_client:
+            await self.query_client.close()
+            
+        self.logger.info("系统已停止")
 
     async def handle_error(self, error: Exception, context: str = ""):
         """统一错误处理"""
@@ -2624,7 +2847,7 @@ class BinanceSniper:
                 if choice == '1':
                     await self._set_api_keys()
                 elif choice == '2':
-                    await self._set_strategy()
+                    await self.setup_snipe_strategy_async()
                 elif choice == '3':
                     await self._show_current_strategy()
                 elif choice == '4':
@@ -2645,29 +2868,53 @@ class BinanceSniper:
     async def _set_api_keys(self):
         """设置API密钥"""
         try:
-            # 检查是否已经设置了API密钥
-            if await self.config.api_manager.has_keys():
+            # 首先检查配置文件是否存在
+            config_path = '/root/config/binance_api.json'
+            current_config = None
+            
+            if os.path.exists(config_path):
+                try:
+                    with open(config_path, 'r') as f:
+                        current_config = json.load(f)
+                        # 更新配置管理器中的密钥
+                        self.config.api_manager.keys = {
+                            'trade': {
+                                'api_key': current_config['trade']['key'],
+                                'api_secret': current_config['trade']['secret']
+                            },
+                            'query': {
+                                'api_key': current_config['query']['key'],
+                                'api_secret': current_config['query']['secret']
+                            }
+                        }
+                except Exception as e:
+                    self.logger.error(f"读取配置文件失败: {str(e)}")
+                    current_config = None
+            
+            if current_config:
                 print("\n=== 当前API密钥状态 ===")
-                keys = await self.config.api_manager.get_api_keys()
-                print(f"交易API Key: {mask_api_key(keys['trade']['key'])}")
-                print(f"查询API Key: {mask_api_key(keys['query']['key'])}")
+                print(f"交易API Key: {mask_api_key(current_config['trade']['key'])}")
+                print(f"查询API Key: {mask_api_key(current_config['query']['key'])}")
                 
-                # 测试现有API
-                print("\n正在测试现有API连接...")
+                # 测试现有API连接 - 只初始化必要的组件
+                print("\n正在测试API连接...")
                 test_result = await self._test_api_connection()
+                
                 if test_result['success']:
                     print("\n=== API测试结果 ===")
                     print("✅ API连接正常")
                     print("交易API权限:", ", ".join(test_result['permissions']['trade']))
                     print("查询API权限:", ", ".join(test_result['permissions']['query']))
                     print(f"网络延迟: {test_result['latency']:.2f}ms")
+                    
+                    # 询问是否需要更换
+                    choice = input("\n当前API可以正常使用，是否需要更换? (yes/no): ").strip().lower()
+                    if choice != 'yes':
+                        print("\n继续使用当前API密钥")
+                        return True
                 else:
-                    print("\n❌ API测试失败:", test_result['error'])
-                
-                choice = input("\n是否要更换API密钥? (yes/no): ").strip().lower()
-                if choice != 'yes':
-                    print("\n保持当前API密钥设置")
-                    return
+                    print(f"\n❌ 当前API测试失败: {test_result['error']}")
+                    print("建议重新设置API密钥")
             
             # 设置新的API密钥
             print("\n=== 设置新API密钥 ===")
@@ -2679,124 +2926,113 @@ class BinanceSniper:
             query_key = input("请输入查询API Key: ").strip()
             query_secret = input("请输入查询API Secret: ").strip()
             
-            # 验证并保存API密钥
-            if await self.config.api_manager.set_api_keys('trade', trade_key, trade_secret) and \
-               await self.config.api_manager.set_api_keys('query', query_key, query_secret):
-                
-                # 保存到配置文件
-                config_path = os.path.expanduser('~/config/binance_api.json')
-                os.makedirs(os.path.dirname(config_path), exist_ok=True)
-                
-                config_data = {
-                    'trade': {
-                        'key': trade_key,
-                        'secret': trade_secret
-                    },
-                    'query': {
-                        'key': query_key,
-                        'secret': query_secret
-                    }
+            # 更新配置管理器中的密钥
+            self.config.api_manager.keys = {
+                'trade': {
+                    'api_key': trade_key,
+                    'api_secret': trade_secret
+                },
+                'query': {
+                    'api_key': query_key,
+                    'api_secret': query_secret
                 }
-                
-                with open(config_path, 'w') as f:
-                    json.dump(config_data, f, indent=4)
-                
-                # 测试新API连接
-                test_result = await self._test_api_connection()
-                if test_result['success']:
-                    self.printer.print_success("✅ API密钥设置成功!")
-                    print("\n=== API测试结果 ===")
-                    print("交易API权限:", ", ".join(test_result['permissions']['trade']))
-                    print("查询API权限:", ", ".join(test_result['permissions']['query']))
-                    print(f"网络延迟: {test_result['latency']:.2f}ms")
-                else:
-                    self.printer.print_error(f"❌ API测试失败: {test_result['error']}")
+            }
+            
+            # 保存新的配置
+            config_data = {
+                'trade': {
+                    'key': trade_key,
+                    'secret': trade_secret
+                },
+                'query': {
+                    'key': query_key,
+                    'secret': query_secret
+                }
+            }
+            
+            # 确保配置目录存在
+            os.makedirs(os.path.dirname(config_path), exist_ok=True)
+            
+            # 保存配置
+            with open(config_path, 'w') as f:
+                json.dump(config_data, f, indent=4)
+            
+            # 测试新API
+            test_result = await self._test_api_connection()
+            if test_result['success']:
+                print("\n✅ API密钥设置成功!")
+                print("\n=== API测试结果 ===")
+                print("交易API权限:", ", ".join(test_result['permissions']['trade']))
+                print("查询API权限:", ", ".join(test_result['permissions']['query']))
+                print(f"网络延迟: {test_result['latency']:.2f}ms")
+                return True
             else:
-                self.printer.print_error("❌ API密钥设置失败!")
+                print(f"\n❌ API测试失败: {test_result['error']}")
+                print("请检查API密钥是否正确")
+                return False
                 
         except Exception as e:
             self.logger.error(f"设置API密钥失败: {str(e)}")
-            self.printer.print_error("设置过程出现错误")
+            print("\n❌ 设置过程出现错误")
+            return False
 
     async def _test_api_connection(self) -> Dict:
         """测试API连接"""
         try:
-            result = {
-                'success': False,
-                'permissions': {
-                    'trade': [],
-                    'query': []
-                },
-                'latency': 0,
-                'error': ''
-            }
+            from urllib.parse import urlencode
             
             start_time = time.perf_counter()
+            session = await self._get_session()
             
-            # 测试API连通性和权限
-            try:
-                async with aiohttp.ClientSession() as session:
-                    # 测试交易API
-                    # 修改这里：添加 await
-                    trade_key, trade_secret = await self.config.api_manager.get_api_keys('trade')
-                    timestamp = str(int(time.time() * 1000))
-                    signature = self._generate_signature(timestamp, trade_secret)
-                    
-                    headers = {
-                        'X-MBX-APIKEY': trade_key
-                    }
-                    
-                    params = {
-                        'timestamp': timestamp,
-                        'signature': signature
-                    }
-                    
-                    async with session.get(
-                        'https://api.binance.com/api/v3/account',
-                        headers=headers,
-                        params=params
-                    ) as response:
-                        if response.status == 200:
-                            result['permissions']['trade'] = ['SPOT_TRADE', 'USER_DATA']
-                        else:
-                            data = await response.json()
-                            result['error'] = f"交易API测试失败: {data.get('msg', '未知错误')}"
-                            return result
-                            
-                    # 测试查询API
-                    # 修改这里：添加 await 并修改返回值处理
-                    query_key, query_secret = await self.config.api_manager.get_api_keys('query')
-                    headers = {
-                        'X-MBX-APIKEY': query_key
-                    }
-                    
-                    async with session.get(
-                        'https://api.binance.com/api/v3/ping',
-                        headers=headers
-                    ) as response:
-                        if response.status == 200:
-                            result['permissions']['query'] = ['MARKET_DATA', 'USER_STREAM']
-                        else:
-                            data = await response.json()
-                            result['error'] = f"查询API测试失败: {data.get('msg', '未知错误')}"
-                            return result
-                            
-                # 计算延迟
-                result['latency'] = (time.perf_counter() - start_time) * 1000
-                result['success'] = True
-                
-                return result
-                
-            except Exception as e:
-                result['error'] = f"API连接测试失败: {str(e)}"
-                return result
-                
+            # 测试交易API
+            timestamp = str(int(time.time() * 1000))
+            params = {
+                'timestamp': timestamp,
+                'recvWindow': '5000'
+            }
+            
+            query_string = urlencode(params)
+            signature = hmac.new(
+                self.config.api_manager.keys['trade']['api_secret'].encode('utf-8'),
+                query_string.encode('utf-8'),
+                hashlib.sha256
+            ).hexdigest()
+            
+            params['signature'] = signature
+
+            url = 'https://api.binance.com/api/v3/account'
+            headers = {'X-MBX-APIKEY': self.config.api_manager.keys['trade']['api_key']}
+            
+            # 只测试 REST API 连接
+            async with session.get(url, headers=headers, params=params) as resp:
+                if resp.status != 200:
+                    raise Exception(f"交易API测试失败: HTTP {resp.status}")
+                await resp.json()
+
+            # 测试查询API
+            url = 'https://api.binance.com/api/v3/time'
+            headers = {'X-MBX-APIKEY': self.config.api_manager.keys['query']['api_key']}
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    raise Exception(f"查询API测试失败: HTTP {resp.status}")
+                await resp.json()
+
+            latency = (time.perf_counter() - start_time) * 1000
+
+            return {
+                'success': True,
+                'permissions': {
+                    'trade': ['SPOT_TRADE', 'USER_DATA'],
+                    'query': ['MARKET_DATA', 'USER_STREAM']
+                },
+                'latency': latency
+            }
+
         except Exception as e:
+            self.logger.error(f"API测试异常: {str(e)}")
             return {
                 'success': False,
-                'permissions': {'trade': [], 'query': []},
-                'latency': 0,
-                'error': str(e)
+                'error': f'API测试失败: {str(e)}'
             }
 
     def _generate_signature(self, timestamp: str, secret_key: str) -> str:
@@ -2809,275 +3045,72 @@ class BinanceSniper:
         ).hexdigest()
         return signature
 
-    async def _set_strategy(self):
-        """设置抢购策略"""
+    async def cleanup(self):
+        """清理资源"""
         try:
-            print("\n=== 抢购策略设置 ===")
-            
-            # 1. 基础设置
-            symbol = input("请输入交易对 (例如 BTC): ").strip().upper()
-            amount = float(input("请输入买入金额 (USDT): ").strip())
-            
-            # 2. 价格保护设置
-            print("\n>>> 价格保护设置")
-            print("价格保护机制说明:")
-            print("1. 最高接受单价: 绝对价格上限，无论如何都不会超过此价格")
-            print("2. 开盘价倍数: 相对于第一档价格的最大倍数")
-            
-            max_price = float(input("设置最高接受单价 (USDT): ").strip())
-            price_multiplier = float(input("设置开盘价倍数 (例如 3 表示最高接受开盘价的3倍): ").strip())
-            
-            # 3. 开盘时间设置
-            print("\n>>> 开盘时间设置")
-            print("请输入开盘时间 (东八区/北京时间)")
-            
-            # 获取当前服务器时间作为参考
-            server_time = await self.query_client.fetch_time()
-            current_time = datetime.fromtimestamp(server_time/1000, self.timezone)
-            print(f"\n当前币安服务器时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
-            
-            while True:
-                try:
-                    year = int(input("年 (例如 2024): ").strip())
-                    if year < 2024 or year > 2100:
-                        print("年份无效，请输入2024-2100之间的年份")
-                        continue
-                        
-                    month = int(input("月 (1-12): ").strip())
-                    if month < 1 or month > 12:
-                        print("月份必须在1-12之间")
-                        continue
-                        
-                    day = int(input("日 (1-31): ").strip())
-                    if day < 1 or day > 31:
-                        print("日期必须在1-31之间")
-                        continue
-                        
-                    hour = int(input("时 (0-23): ").strip())
-                    if hour < 0 or hour > 23:
-                        print("小时必须在0-23之间")
-                        continue
-                        
-                    minute = int(input("分 (0-59): ").strip())
-                    if minute < 0 or minute > 59:
-                        print("分钟必须在0-59之间")
-                        continue
-                        
-                    second = int(input("秒 (0-59): ").strip())
-                    if second < 0 or second > 59:
-                        print("秒数必须在0-59之间")
-                        continue
-                    
-                    # 创建开盘时间
-                    opening_time = self.timezone.localize(datetime(year, month, day, hour, minute, second))
-                    
-                    # 检查是否早于当前时间
-                    if opening_time <= current_time:
-                        print("错误: 开盘时间不能早于当前时间")
-                        continue
-                    
-                    # 显示时间信息
-                    time_diff = opening_time - current_time
-                    hours = time_diff.total_seconds() / 3600
-                    
-                    print(f"\n=== 时间信息 ===")
-                    print(f"设置开盘时间: {opening_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
-                    print(f"当前服务器时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
-                    print(f"距离开盘还有: {hours:.1f}小时")
-                    
-                    confirm = input("\n确认使用这个开盘时间? (yes/no): ").strip().lower()
-                    if confirm == 'yes':
-                        break
-                    
-                except ValueError:
-                    print("时间格式无效，请重新输入")
-                    continue
-
-            # 4. 止盈设置
-            take_profits = []
-            remaining_percentage = 100
-            print("\n设置阶梯止盈 (最多5档):")
-            
-            for i in range(5):
-                print(f"\n当前剩余可设置比例: {remaining_percentage}%")
-                profit = input(f"第{i+1}档止盈比例 (%, 直接回车结束): ").strip()
-                if not profit:
-                    if not take_profits:
-                        print("❌ 错误: 至少需要设置一档止盈!")
-                        continue
-                    break
-                    
-                try:
-                    profit_value = float(profit)
-                    if profit_value <= 0:
-                        print("❌ 错误: 止盈比例必须大于0%")
-                        continue
-                        
-                    if i > 0 and profit_value <= float(take_profits[-1][0] * 100):
-                        print(f"❌ 错误: 第{i+1}档止盈比例必须大于第{i}档的{float(take_profits[-1][0] * 100)}%")
-                        continue
-                        
-                    amount = input(f"第{i+1}档卖出比例 (%): ").strip()
-                    amount_value = float(amount)
-                    
-                    if amount_value <= 0:
-                        print("❌ 错误: 卖出比例必须大于0%")
-                        continue
-                        
-                    if amount_value > remaining_percentage:
-                        print(f"❌ 错误: 卖出比例不能超过剩余可设置比例 {remaining_percentage}%")
-                        continue
-                        
-                    take_profits.append((profit_value/100, amount_value/100))
-                    remaining_percentage -= amount_value
-                    
-                    if remaining_percentage == 0:
-                        print("\n✅ 已达到100%卖出比例，完成设置")
-                        break
-                        
-                except ValueError:
-                    print("❌ 错误: 请输入有效的数字")
-                    continue
-            
-            # 如果设置完成但未达到100%，显示提示
-            if remaining_percentage > 0:
-                print(f"\n⚠️ 提示: 还有 {remaining_percentage}% 的仓位未设置止盈策略")
-                confirm = input("是否继续? (yes/no): ").strip().lower()
-                if confirm != 'yes':
-                    return
-
-            # 5. 止损设置
-            stop_loss = float(input("\n请输入止损比例 (%): ").strip())
-            
-            # 6. 保存策略
-            self.strategy = {
-                'symbol': symbol,
-                'amount': amount,
-                'max_price': max_price,
-                'price_multiplier': price_multiplier,
-                'opening_time': opening_time,
-                'take_profits': take_profits,
-                'stop_loss': stop_loss,
-                'remaining_percentage': remaining_percentage
-            }
-            
-            # 7. 显示策略摘要
-            print("\n=== 策略摘要 ===")
-            print(f"交易对: {symbol}USDT")
-            print(f"买入金额: {amount} USDT")
-            print(f"价格保护:")
-            print(f"- 最高限价: {max_price} USDT")
-            print(f"- 开盘价倍数: {price_multiplier}倍")
-            print(f"开盘时间: {opening_time.strftime('%Y-%m-%d %H:%M:%S')} (东八区)")
-            print(f"止损设置: -{stop_loss}%")
-            print("止盈设置:")
-            for i, (profit, amount) in enumerate(take_profits, 1):
-                print(f"- 第{i}档: 涨幅{profit*100}% 卖出{amount*100}%")
-            if remaining_percentage > 0:
-                print(f"未设置比例: {remaining_percentage}%")
-            
-            self.printer.print_success("✅ 策略设置成功!")
-            
+            # 关闭 session
+            if self._session and not self._session.closed:
+                await self._session.close()
+                
+            if self.trade_client:
+                await self.trade_client.close()
+            if self.query_client:
+                await self.query_client.close()
         except Exception as e:
-            self.logger.error(f"设置策略失败: {str(e)}")
-            self.printer.print_error("设置过程出现错误")
+            self.logger.error(f"清理资源时出错: {str(e)}")
+            
+    async def __aenter__(self):
+        """异步上下文管理器入口"""
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """异步上下文管理器出口"""
+        await self.cleanup()
 
     async def _show_current_strategy(self):
         """显示当前策略"""
         try:
-            strategy = await self.config.get_strategy()
-            if not strategy:
-                self.printer.print_warning("当前没有设置策略")
+            config_path = os.path.join(CONFIG_DIR, 'snipe_strategy.json')
+            if not os.path.exists(config_path):
+                print("\n⚠️ 未找到策略配置文件")
                 return
                 
-            # 获取市场数据
-            market_data = await self.market_monitor.get_market_data(strategy['symbol'])
-            
-            # 显示策略详情
-            self.printer.print_strategy_status({
-                'symbol': strategy['symbol'],
-                'amount': strategy['amount'],
-                'max_price': strategy['max_price'],
-                'take_profits': strategy['take_profits'],
-                'stop_loss': strategy['stop_loss'],
-                'market_data': market_data,
-                'opening_time': await self.market_monitor.get_opening_time(strategy['symbol']),
-                'usdt_balance': await self.order_executor._get_balance()
+            with open(config_path, 'r') as f:
+                strategy_data = json.load(f)
+        
+            # 添加市场数据
+            strategy_data['market_data'] = {
+                'market_status': '正常',
+                'current_price': 0,  # 新币未上市
+                'price_24h_change': 0,
+                'volume_24h': 0,
+                'network_latency': 100,  # 默认值
+                'time_offset': 0
+            }
+        
+            # 添加缺失的字段
+            strategy_data.update({
+                'concurrent_orders': 3,  # 默认并发订单数
+                'usdt_balance': 0,  # 将在后续查询更新
             })
-            
+        
+            # 转换开盘时间字符串为datetime对象
+            strategy_data['opening_time'] = datetime.fromisoformat(strategy_data['opening_time'])
+        
+            # 获取账户USDT余额
+            try:
+                if self.trade_client:
+                    balance = await self.trade_client.fetch_balance()
+                    strategy_data['usdt_balance'] = float(balance.get('USDT', {}).get('free', 0))
+            except:
+                strategy_data['usdt_balance'] = 0
+        
+            # 使用PrintManager显示策略
+            self.printer.print_strategy_status(strategy_data)
+        
         except Exception as e:
-            self.logger.error(f"显示策略失败: {str(e)}")
-            self.printer.print_error("显示策略出现错误")
-
-    async def _start_snipe(self):
-        """开始抢购"""
-        try:
-            # 获取当前策略
-            strategy = await self.config.get_strategy()
-            if not strategy:
-                self.printer.print_error("请先设置抢购策略!")
-                return
-                
-            # 显示当前策略
-            await self._show_current_strategy()
-            
-            # 确认执行
-            confirm = input("\n确认开始执行抢购策略? (yes/no): ").strip().lower()
-            if confirm != 'yes':
-                print("\n已取消执行")
-                return
-                
-            # 开始执行
-            result = await self.execute_snipe(
-                symbol=strategy['symbol'],
-                amount=strategy['amount'],
-                price=strategy['max_price']
-            )
-            
-            if result:
-                self.printer.print_execution_result(result)
-            else:
-                self.printer.print_error("抢购执行失败!")
-                
-        except Exception as e:
-            self.logger.error(f"抢购执行失败: {str(e)}")
-            self.printer.print_error("执行过程出现错误")
-
-    async def _run_tests(self):
-        """运行测试"""
-        try:
-            print("\n=== 测试中心 ===")
-            print("1. 网络测试")
-            print("2. API测试")
-            print("3. 订单测试")
-            print("4. 性能测试")
-            print("5. 全面测试")
-            print("0. 返回主菜单")
-            
-            choice = input("\n请选择测试类型 (0-5): ").strip()
-            
-            if choice == '1':
-                result = await self.test_center.test_network()
-                self.printer.print_test_result('network', result)
-            elif choice == '2':
-                result = await self.test_center.test_api()
-                self.printer.print_test_result('api', result)
-            elif choice == '3':
-                result = await self.test_center.test_orders()
-                self.printer.print_test_result('order', result)
-            elif choice == '4':
-                result = await self.test_center.test_performance()
-                self.printer.print_test_result('performance', result)
-            elif choice == '5':
-                await self.test_center.run_all_tests()
-            elif choice == '0':
-                return
-            else:
-                print("\n无效的选择")
-                
-        except Exception as e:
-            self.logger.error(f"运行测试失败: {str(e)}")
-            self.printer.print_error("测试过程出现错误")
+            self.logger.error(f"读取策略失败: {str(e)}")
+            print("\n❌ 读取策略配置出错")
 
 # =============================== 
 # 模块：打印输出
@@ -3825,6 +3858,7 @@ class WebSocketManager:
         
         self.is_running = False
         self.tasks = []
+        self._session: Optional[aiohttp.ClientSession] = None
 
     async def start(self):
         """启动WebSocket连接"""
@@ -3857,6 +3891,10 @@ class WebSocketManager:
         for conn in self.connections.values():
             if conn:
                 await conn.close()
+                
+        # 关闭 session
+        if self._session and not self._session.closed:
+            await self._session.close()
                 
         self.logger.info("WebSocket管理器已停止")
 
@@ -3900,7 +3938,7 @@ class WebSocketManager:
             }
             
             # 创建连接
-            session = aiohttp.ClientSession()
+            session = await self._get_session()
             ws = await session.ws_connect(
                 self.ws_config['base_url'],
                 heartbeat=self.ws_config['keepalive'],
@@ -4066,6 +4104,7 @@ class PerformanceMonitor:
         
         self.is_running = False
         self.monitor_task = None
+        self._session: Optional[aiohttp.ClientSession] = None
 
     async def start(self):
         """启动性能监控"""
@@ -4088,6 +4127,11 @@ class PerformanceMonitor:
                 await self.monitor_task
             except asyncio.CancelledError:
                 pass
+
+        # 关闭 session
+        if self._session and not self._session.closed:
+            await self._session.close()
+            
         self.logger.info("性能监控已停止")
 
     async def _monitor_loop(self):
@@ -4129,14 +4173,14 @@ class PerformanceMonitor:
             
             # 网络延迟
             start_time = time.perf_counter()
-            async with aiohttp.ClientSession() as session:
-                async with session.get('https://api.binance.com/api/v3/time') as response:
-                    await response.json()
-                    latency = (time.perf_counter() - start_time) * 1000
-                    self.performance_data['network_latency'].append({
-                        'timestamp': time.time(),
-                        'value': latency
-                    })
+            session = await self._get_session()
+            async with session.get('https://api.binance.com/api/v3/time') as response:
+                await response.json()
+                latency = (time.perf_counter() - start_time) * 1000
+                self.performance_data['network_latency'].append({
+                    'timestamp': time.time(),
+                    'value': latency
+                })
                     
         except Exception as e:
             self.logger.error(f"收集性能数据失败: {str(e)}")
@@ -4250,22 +4294,39 @@ class PerformanceMonitor:
             self.logger.error(f"获取历史数据失败: {str(e)}")
             return []
 
-if __name__ == '__main__':
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """获取或创建 session"""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+
+# 替换原来的 if __name__ == '__main__': 部分
+async def main():
+    """主函数"""
     try:
-        # 创建事件循环
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
         # 创建并初始化Sniper
         sniper = BinanceSniper('config.json')
-        loop.run_until_complete(sniper.initialize())
         
-        # 运行菜单
-        loop.run_until_complete(sniper.show_menu())
+        # 初始化和显示菜单
+        await sniper.initialize()
+        await sniper.show_menu()
         
     except Exception as e:
         print(f"程序异常退出: {str(e)}")
     finally:
-        # 清理事件循环
-        if loop.is_running():
-            loop.close()
+        # 确保正确关闭所有异步任务
+        try:
+            tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.get_event_loop().shutdown_asyncgens()
+        except Exception as e:
+            print(f"清理任务时出错: {str(e)}")
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n程序被用户中断")
+    except Exception as e:
+        print(f"程序异常退出: {str(e)}")
